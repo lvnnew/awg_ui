@@ -138,6 +138,25 @@ def _server_label(server: dict) -> str:
     return server.get("name") or server.get("host", "Unknown")
 
 
+def _telemt_apply_url(config: str) -> Optional[str]:
+    """Convert a tg://proxy?... link into the https://t.me/proxy?... form.
+
+    The t.me form is a valid inline-button URL and, when tapped inside
+    Telegram, opens the native "Connect proxy?" dialog — acting as an
+    "Apply" button. Returns None if the config isn't a proxy link."""
+    if not config:
+        return None
+    c = config.strip()
+    marker = "proxy?"
+    idx = c.find(marker)
+    if idx == -1:
+        return None
+    query = c[idx + len(marker):]
+    if not query:
+        return None
+    return f"https://t.me/proxy?{query}"
+
+
 def _main_menu_keyboard() -> dict:
     return {
         "inline_keyboard": [
@@ -470,8 +489,25 @@ async def _send_config(api: TelegramAPI, chat_id: int, name: str, server: dict, 
         f"🔌 Протокол: <b>{_proto_label(proto)}</b>",
     )
 
-    is_link_proto = proto in ("xray", "telemt")
-    if is_link_proto:
+    if proto == "telemt":
+        # config is a tg://proxy?server=...&port=...&secret=... link.
+        # The https://t.me/proxy?... form opens Telegram's native
+        # "Connect proxy?" dialog when tapped — i.e. an "Apply" button.
+        apply_url = _telemt_apply_url(config)
+        kb = None
+        if apply_url:
+            kb = {"inline_keyboard": [[{"text": "✅ Применить (подключить в Telegram)", "url": apply_url}]]}
+        await api.send_message(
+            chat_id,
+            "🔗 <b>Прокси для Telegram</b>\n\n"
+            "• Нажми <b>«Применить»</b> — Telegram сам предложит подключить прокси.\n"
+            "• Или скопируй ссылку вручную (нажми на неё):\n"
+            f"<code>{config}</code>",
+            reply_markup=kb,
+        )
+        return
+
+    if proto == "xray":
         await api.send_message(chat_id, f"🔗 <b>Ссылка для подключения</b> (нажми, чтобы скопировать):\n<code>{config}</code>")
         return
 
