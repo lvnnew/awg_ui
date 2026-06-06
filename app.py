@@ -882,6 +882,8 @@ class InstallProtocolRequest(BaseModel):
     tls_emulation: Optional[bool] = None
     tls_domain: Optional[str] = None
     max_connections: Optional[int] = None
+    # Telemt: domain used in tg:// connection links (public_host). Empty => IP.
+    telemt_public_host: Optional[str] = None
     # SOCKS5
     socks5_username: Optional[str] = None
     socks5_password: Optional[str] = None
@@ -1814,7 +1816,8 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
                 port=req.port,
                 tls_emulation=req.tls_emulation if req.tls_emulation is not None else True,
                 tls_domain=req.tls_domain,
-                max_connections=req.max_connections if req.max_connections is not None else 0
+                max_connections=req.max_connections if req.max_connections is not None else 0,
+                public_host=req.telemt_public_host or ''
             )
         elif req.protocol == 'xray':
             result = manager.install_protocol(port=req.port)
@@ -1853,12 +1856,44 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
             proto_record['internal_ip'] = result.get('internal_ip')
             proto_record['web_port'] = result.get('web_port')
             proto_record['expose_web'] = result.get('expose_web')
+        if req.protocol == 'telemt' and result.get('public_host'):
+            proto_record['public_host'] = result.get('public_host')
         server['protocols'][req.protocol] = proto_record
         save_data(data)
         ssh.disconnect()
         return result
     except Exception as e:
         logger.exception("Error installing protocol")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+class TelemtDomainRequest(BaseModel):
+    domain: Optional[str] = ''
+
+
+@app.post('/api/servers/{server_id}/telemt/domain', tags=["Protocols"])
+async def api_telemt_set_domain(request: Request, server_id: int, req: TelemtDomainRequest):
+    """Set the domain used in Telemt tg:// connection links (public_host)
+    without reinstalling. Empty domain reverts to the server IP."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        manager = get_protocol_manager(ssh, 'telemt')
+        link_host = manager.set_public_host(req.domain or '')
+        ssh.disconnect()
+        protos = server.setdefault('protocols', {})
+        if 'telemt' in protos:
+            protos['telemt']['public_host'] = link_host
+            save_data(data)
+        return {'status': 'success', 'public_host': link_host}
+    except Exception as e:
+        logger.exception("Error setting Telemt domain")
         return JSONResponse({'error': str(e)}, status_code=500)
 
 

@@ -127,7 +127,7 @@ docker compose version
         if code != 0:
             raise RuntimeError(f"Failed to install docker compose plugin: {err or out}")
 
-    def install_protocol(self, protocol_type='telemt', port='443', tls_emulation=True, tls_domain="", max_connections=0):
+    def install_protocol(self, protocol_type='telemt', port='443', tls_emulation=True, tls_domain="", max_connections=0, public_host=""):
         results = []
         if not self.check_docker_installed():
             results.append("Installing Docker...")
@@ -161,11 +161,13 @@ docker compose version
         if max_connections is not None and max_connections > 0:
             config_content = re.sub(r'max_connections\s*=\s*\d+', f'max_connections = {max_connections}', config_content)
 
-        # Patch public_host and public_port for links
+        # Patch public_host (host shown in tg:// links) and public_port.
+        # A domain may be supplied; otherwise fall back to the server IP.
+        link_host = (public_host or '').strip() or self.ssh.host
         if "public_host =" in config_content or "# public_host =" in config_content:
-            config_content = re.sub(r'#?\s*public_host\s*=\s*".*?"', f'public_host = "{self.ssh.host}"', config_content)
+            config_content = re.sub(r'#?\s*public_host\s*=\s*".*?"', f'public_host = "{link_host}"', config_content)
         else:
-            config_content = config_content.replace('[general.links]', f'[general.links]\npublic_host = "{self.ssh.host}"')
+            config_content = config_content.replace('[general.links]', f'[general.links]\npublic_host = "{link_host}"')
             
         config_content = re.sub(r'public_port\s*=\s*\d+', f'public_port = {port}', config_content)
         
@@ -206,8 +208,29 @@ docker compose version
             "status": "success",
             "host": "",
             "port": port,
+            "public_host": link_host,
             "log": results
         }
+
+    def set_public_host(self, domain=""):
+        """Change the host used in tg:// connection links (public_host) on an
+        already-running proxy, without reinstalling — patches config.toml and
+        reloads via SIGHUP so existing users/secrets are preserved. Pass an
+        empty value to fall back to the server IP. Returns the host applied."""
+        link_host = (domain or '').strip() or self.ssh.host
+        config_content = self._get_server_config()
+        if not config_content.strip():
+            raise RuntimeError("Telemt config.toml not found on server")
+
+        if re.search(r'#?\s*public_host\s*=\s*".*?"', config_content):
+            config_content = re.sub(r'#?\s*public_host\s*=\s*".*?"', f'public_host = "{link_host}"', config_content)
+        elif '[general.links]' in config_content:
+            config_content = config_content.replace('[general.links]', f'[general.links]\npublic_host = "{link_host}"')
+        else:
+            config_content += f'\n[general.links]\npublic_host = "{link_host}"\n'
+
+        self.save_server_config('telemt', config_content)
+        return link_host
 
     def _get_server_config(self):
         out, _, code = self.ssh.run_sudo_command(f"cat /opt/amnezia/telemt/config.toml")
@@ -230,7 +253,10 @@ docker compose version
         
         m = re.search(r'max_connections\s*=\s*(\d+)', config_text)
         if m: params['max_connections'] = int(m.group(1))
-        
+
+        m = re.search(r'^\s*public_host\s*=\s*"([^"]+)"', config_text, re.MULTILINE)
+        if m: params['public_host'] = m.group(1)
+
         return params
 
     def remove_container(self, protocol_type=None):
