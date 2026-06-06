@@ -179,6 +179,9 @@ docker compose version
             compose_content = f.read()
             
         compose_content = re.sub(r'"443:443"', f'"{port}:443"', compose_content)
+        # Drop local build — we ship a pre-built GHCR image. Older hosts often
+        # lack buildx >=0.17 and `docker compose up --build` then fails silently.
+        compose_content = re.sub(r'^\s*build:\s*\.\s*$', '', compose_content, flags=re.MULTILINE)
         self.ssh.upload_file_sudo(compose_content, f"{remote_dir}/docker-compose.yml")
         
         # Upload Dockerfile
@@ -186,10 +189,18 @@ docker compose version
             dockerfile = f.read()
             self.ssh.upload_file_sudo(dockerfile, f"{remote_dir}/Dockerfile")
             
+        results.append("Pulling Telemt image...")
+        self.ssh.run_sudo_command("docker pull ghcr.io/telemt/telemt:latest", timeout=300)
         results.append("Starting Telemt container...")
-        out, err, code = self.ssh.run_sudo_command(f"sh -c 'cd {remote_dir} && docker compose up -d --build'", timeout=600)
+        out, err, code = self.ssh.run_sudo_command(
+            f"sh -c 'cd {remote_dir} && docker compose up -d --no-build'", timeout=300
+        )
         if code != 0:
-            self.ssh.run_sudo_command(f"sh -c 'cd {remote_dir} && docker-compose up -d --build'", timeout=600)
+            out, err, code = self.ssh.run_sudo_command(
+                f"sh -c 'cd {remote_dir} && docker-compose up -d --no-build'", timeout=300
+            )
+        if code != 0:
+            raise RuntimeError(f"Failed to start Telemt container: {err or out}")
                 
         return {
             "status": "success",
