@@ -205,6 +205,19 @@ def generate_vpn_link(config_text):
 
 # ===================== Self-service registration (invite codes) =====================
 
+def make_unique_connection_name(data: dict, base: str) -> str:
+    """Return a connection/device name that does not collide with any existing
+    user_connection name (case-insensitive, across all servers). Appends -2, -3…"""
+    base = (base or '').strip() or 'Device'
+    existing = {str(c.get('name', '')).strip().lower() for c in data.get('user_connections', [])}
+    if base.lower() not in existing:
+        return base
+    i = 2
+    while f"{base}-{i}".lower() in existing:
+        i += 1
+    return f"{base}-{i}"
+
+
 def _new_invite_code() -> str:
     """Short, human-friendly invite code (no easily-confused chars)."""
     alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -311,11 +324,15 @@ def create_user_connection(user_id: str, server_id: int, protocol: str, name: st
         return {'error': 'protocol_not_installed'}
     port = proto_info.get('port', '55424')
 
+    # Client names double as identifiers in the server clientsTable, so they must
+    # be globally unique — otherwise get_client_config can match the wrong client.
+    unique_name = make_unique_connection_name(data, name)
+
     ssh = get_ssh(server)
     ssh.connect()
     try:
         manager = get_protocol_manager(ssh, protocol)
-        result = manager.add_client(protocol, name, server['host'], port)
+        result = manager.add_client(protocol, unique_name, server['host'], port)
     finally:
         ssh.disconnect()
 
@@ -328,7 +345,7 @@ def create_user_connection(user_id: str, server_id: int, protocol: str, name: st
         'server_id': server_id,
         'protocol': protocol,
         'client_id': result['client_id'],
-        'name': name,
+        'name': unique_name,
         'created_at': datetime.now().isoformat(),
     }
     data = load_data()  # reload to avoid clobbering concurrent writes

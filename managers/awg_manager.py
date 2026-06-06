@@ -113,6 +113,8 @@ class AWGManager:
 
     def __init__(self, ssh_manager):
         self.ssh = ssh_manager
+        # Cache of runtime-detected layouts, keyed by protocol_type.
+        self._layout_cache = {}
 
     def _container_name(self, protocol_type):
         """Get Docker container name for protocol type."""
@@ -122,35 +124,64 @@ class AWGManager:
             return 'amnezia-awg2'
         return 'amnezia-awg'
 
+    # ------------------------------------------------------------------ #
+    #  Layout detection
+    #
+    #  The Amnezia client app provisions AmneziaWG under the standard
+    #  container name `amnezia-awg`, but depending on its version the config
+    #  file is either `awg0.conf` (awg/awg-quick, awg0 iface) or the legacy
+    #  `wg0.conf` (wg/wg-quick, wg0 iface). The fixed `awg` variant assumed
+    #  awg0.conf, so client creation failed on the (very common) wg0.conf
+    #  installs. We probe the container once and adapt.
+    # ------------------------------------------------------------------ #
+    def _detect_awg_layout(self, protocol_type):
+        if protocol_type in self._layout_cache:
+            return self._layout_cache[protocol_type]
+
+        # Defaults for new-style AWG / AWG2.
+        layout = {'config': 'awg0.conf', 'wg': 'awg', 'quick': 'awg-quick', 'iface': 'awg0'}
+
+        if protocol_type == self.AWG:
+            container = self._container_name(protocol_type)
+            try:
+                out, _, rc = self.ssh.run_command(
+                    f"docker exec -i {container} sh -c "
+                    f"'if [ -f /opt/amnezia/awg/awg0.conf ]; then echo awg0; "
+                    f"elif [ -f /opt/amnezia/awg/wg0.conf ]; then echo wg0; fi'"
+                )
+                if rc == 0 and out.strip() == 'wg0':
+                    layout = {'config': 'wg0.conf', 'wg': 'wg', 'quick': 'wg-quick', 'iface': 'wg0'}
+            except Exception:
+                pass
+
+        self._layout_cache[protocol_type] = layout
+        return layout
+
     def _config_path(self, protocol_type):
         """Get server config path inside container."""
         if protocol_type == self.AWG_LEGACY:
             return '/opt/amnezia/awg/wg0.conf'
-        # Both AWG and AWG2 use awg0.conf
-        return '/opt/amnezia/awg/awg0.conf'
+        return '/opt/amnezia/awg/' + self._detect_awg_layout(protocol_type)['config']
 
     def _wg_binary(self, protocol_type):
         """Get the wireguard binary name."""
         if protocol_type == self.AWG_LEGACY:
             return 'wg'
-        # AWG and AWG2 both use 'awg' binary
-        return 'awg'
+        return self._detect_awg_layout(protocol_type)['wg']
 
 
     def _quick_binary(self, protocol_type):
         """Get the wireguard-quick binary name."""
         if protocol_type == self.AWG_LEGACY:
             return 'wg-quick'
-        # AWG and AWG2 both use 'awg-quick'
-        return 'awg-quick'
+        return self._detect_awg_layout(protocol_type)['quick']
 
 
     def _interface_name(self, protocol_type):
         """Get the interface name."""
         if protocol_type == self.AWG_LEGACY:
             return 'wg0'
-        # AWG and AWG2 both use 'awg0' interface
-        return 'awg0'
+        return self._detect_awg_layout(protocol_type)['iface']
 
     def _docker_image(self, protocol_type):
         """Get Docker image for protocol type."""

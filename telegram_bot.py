@@ -304,7 +304,9 @@ async def _ask_device_name(api: TelegramAPI, chat_id: int, message_id: int, tg_i
         chat_id, message_id,
         f"Сервер: <b>{_server_label(server)}</b>\n"
         f"Протокол: <b>{_proto_label(proto)}</b>\n\n"
-        "Как назвать устройство? Пришли название (например <i>iPhone</i> или <i>Ноутбук</i>).",
+        "✍️ <b>Пришли своё название устройства</b> (например <i>iPhone</i> или <i>Ноутбук</i>),\n"
+        "либо нажми «🎲 Авто-имя» — сгенерирую автоматически.\n\n"
+        "<i>Имя будет сделано уникальным автоматически.</i>",
         reply_markup={"inline_keyboard": [
             [{"text": "🎲 Авто-имя", "callback_data": f"auto:{server_id}:{proto}"}],
             [{"text": "⬅️ Меню", "callback_data": "menu"}],
@@ -322,18 +324,23 @@ async def _create_and_send(api: TelegramAPI, chat_id: int, tg_id: str, server_id
     loading_id = loading.get("result", {}).get("message_id")
 
     create_fn = services["create_user_connection"]
-    res = await asyncio.to_thread(create_fn, panel_user["id"], server_id, proto, name)
+    try:
+        res = await asyncio.to_thread(create_fn, panel_user["id"], server_id, proto, name)
+    except Exception as e:
+        logger.exception("Bot: error creating connection")
+        res = {"error": str(e)}
 
     if "error" in res:
         msg = {
             "protocol_not_installed": "❌ Этот протокол не установлен на сервере.",
             "server_not_found": "❌ Сервер не найден.",
+            "user_not_found": "❌ Профиль не найден. Зарегистрируйся заново: /start",
             "create_failed": "❌ Не удалось создать клиента на сервере.",
-        }.get(res["error"], f"❌ Ошибка: {res['error']}")
+        }.get(res["error"], f"❌ Не удалось создать конфиг.\n<code>{res['error']}</code>")
         if loading_id:
-            await api.edit_message(chat_id, loading_id, msg)
+            await api.edit_message(chat_id, loading_id, msg, reply_markup=_main_menu_keyboard())
         else:
-            await api.send_message(chat_id, msg)
+            await api.send_message(chat_id, msg, reply_markup=_main_menu_keyboard())
         return
 
     if loading_id:
@@ -578,9 +585,8 @@ async def _dispatch(api: TelegramAPI, update: dict, services: dict):
             await api.answer_callback(callback_id, "Создаю…")
             _, sid, proto = data_str.split(":", 2)
             _pending.pop(tg_id, None)
-            import time
-            name = f"Device-{int(time.time()) % 10000}"
-            await _create_and_send(api, chat_id, tg_id, int(sid), proto, name, services)
+            # Base "Device"; the backend guarantees a globally unique final name.
+            await _create_and_send(api, chat_id, tg_id, int(sid), proto, "Device", services)
         elif data_str.startswith("cfg:"):
             await _handle_get_existing_config(api, chat_id, callback_id, data_str[4:], tg_id, services)
         else:
