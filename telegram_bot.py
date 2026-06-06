@@ -163,6 +163,7 @@ def _main_menu_keyboard() -> dict:
             [{"text": "➕ Новое устройство / конфиг", "callback_data": "new"}],
             [{"text": "📂 Мои конфиги", "callback_data": "mine"}],
             [{"text": "📊 Статус серверов", "callback_data": "status"}],
+            [{"text": "ℹ️ Помощь", "callback_data": "help"}],
         ]
     }
 
@@ -196,14 +197,38 @@ _REG_ERRORS = {
 }
 
 
+def _welcome_text(first_name: str) -> str:
+    name = first_name or "друг"
+    return (
+        f"👋 Привет, <b>{name}</b>!\n\n"
+        "Это бот для доступа к личному VPN. Здесь ты сам создаёшь конфиги "
+        "для своих устройств.\n\n"
+        "🔑 Чтобы начать, пришли свой <b>код регистрации</b> одним сообщением "
+        "(или командой <code>/register КОД</code>).\n\n"
+        "ℹ️ <b>Важно:</b>\n"
+        "• Один пользователь — один код. Код одноразовый и привязывается к тебе.\n"
+        "• Один конфиг — одно устройство. Для каждого телефона/ноутбука создавай отдельный конфиг."
+    )
+
+
+def _help_text(username: Optional[str] = None) -> str:
+    intro = "✅ Ты в системе.\n\n"
+    if username:
+        intro = f"✅ Ты в системе как <b>{username}</b>.\n\n"
+    return (
+        intro +
+        "Как пользоваться:\n"
+        "➕ «Новое устройство / конфиг» — создать конфиг (сервер → протокол → имя).\n"
+        "📂 «Мои конфиги» — список твоих конфигов и их выдача.\n"
+        "📊 «Статус серверов» — доступность и пинг.\n\n"
+        "⚠️ Помни: <b>один конфиг = одно устройство</b>. "
+        "Не передавай свои конфиги другим — у каждого должен быть свой код."
+    )
+
+
 async def _show_welcome_for_new(api: TelegramAPI, chat_id: int, tg_id: str, first_name: str):
     _pending[tg_id] = {"action": "await_code"}
-    await api.send_message(
-        chat_id,
-        f"👋 Привет, <b>{first_name}</b>!\n\n"
-        "Чтобы пользоваться VPN, нужен <b>код регистрации</b> от администратора.\n\n"
-        "Пришли его сюда одним сообщением (или командой <code>/register КОД</code>).",
-    )
+    await api.send_message(chat_id, _welcome_text(first_name))
 
 
 async def _try_register(api: TelegramAPI, chat_id: int, tg_id: str, first_name: str, code: str, services: dict):
@@ -221,7 +246,7 @@ async def _try_register(api: TelegramAPI, chat_id: int, tg_id: str, first_name: 
         chat_id,
         f"🎉 Регистрация прошла успешно!\n"
         f"Твой логин в системе: <b>{res.get('username')}</b>.\n\n"
-        "Теперь можешь создавать персональные конфиги для своих устройств.",
+        + _help_text(),
         reply_markup=_main_menu_keyboard(),
     )
 
@@ -265,6 +290,18 @@ async def _show_menu(api: TelegramAPI, chat_id: int, message_id: Optional[int], 
         await _show_welcome_for_new(api, chat_id, tg_id, "")
         return
     text = f"Ты в системе как <b>{panel_user['username']}</b>.\n\nВыбери действие:"
+    if message_id:
+        await api.edit_message(chat_id, message_id, text, reply_markup=_main_menu_keyboard())
+    else:
+        await api.send_message(chat_id, text, reply_markup=_main_menu_keyboard())
+
+
+async def _show_help(api: TelegramAPI, chat_id: int, message_id: Optional[int], tg_id: str, services: dict):
+    panel_user = _find_user(services["load_data"], tg_id)
+    if not panel_user:
+        await _show_welcome_for_new(api, chat_id, tg_id, "")
+        return
+    text = _help_text(panel_user.get("username"))
     if message_id:
         await api.edit_message(chat_id, message_id, text, reply_markup=_main_menu_keyboard())
     else:
@@ -568,6 +605,7 @@ async def _handle_newcode(api: TelegramAPI, msg: dict, services: dict):
 _PUBLIC_COMMANDS = [
     {"command": "start", "description": "Старт / регистрация по коду"},
     {"command": "menu", "description": "Меню: новое устройство и мои конфиги"},
+    {"command": "help", "description": "Краткая инструкция по боту"},
 ]
 _ADMIN_COMMANDS = _PUBLIC_COMMANDS + [
     {"command": "newcode", "description": "Создать код регистрации (админ)"},
@@ -660,6 +698,9 @@ async def _dispatch(api: TelegramAPI, update: dict, services: dict):
             else:
                 await _try_register(api, chat_id, tg_id, first_name, code, services)
             return
+        if text.startswith("/help"):
+            await _show_help(api, chat_id, None, tg_id, services)
+            return
         if text.startswith("/menu") or text.startswith("/connections"):
             await _show_menu(api, chat_id, None, tg_id, services)
             return
@@ -703,6 +744,9 @@ async def _dispatch(api: TelegramAPI, update: dict, services: dict):
         elif data_str == "status":
             await api.answer_callback(callback_id, "Проверяю серверы…")
             await _show_status(api, chat_id, message_id, tg_id, services)
+        elif data_str == "help":
+            await api.answer_callback(callback_id)
+            await _show_help(api, chat_id, message_id, tg_id, services)
         elif data_str.startswith("srv:"):
             await api.answer_callback(callback_id)
             await _show_protocols(api, chat_id, message_id, int(data_str[4:]), services)
