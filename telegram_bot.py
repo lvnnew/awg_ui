@@ -476,6 +476,39 @@ async def _handle_newcode(api: TelegramAPI, msg: dict, services: dict):
 # ----------------------------------------------------------------------- #
 #  Main polling loop
 # ----------------------------------------------------------------------- #
+# Command menu shown by Telegram's "Menu" button.
+_PUBLIC_COMMANDS = [
+    {"command": "start", "description": "Старт / регистрация по коду"},
+    {"command": "menu", "description": "Меню: новое устройство и мои конфиги"},
+]
+_ADMIN_COMMANDS = _PUBLIC_COMMANDS + [
+    {"command": "newcode", "description": "Создать код регистрации (админ)"},
+]
+
+
+async def _setup_commands(api: TelegramAPI, services: dict):
+    """Replace any stale command menu (e.g. left over from a previous use of
+    this bot token) with our own. Public scope gets the basic list; each admin
+    chat additionally sees /newcode."""
+    # Clear all previously-configured commands across scopes we manage, then set ours.
+    await api.call("deleteMyCommands")
+    await api.call("setMyCommands", commands=_PUBLIC_COMMANDS)
+
+    data = services["load_data"]()
+    for u in data.get("users", []):
+        if u.get("role") == "admin" and u.get("telegramId"):
+            chat_id = str(u["telegramId"]).lstrip("@")
+            try:
+                await api.call(
+                    "setMyCommands",
+                    commands=_ADMIN_COMMANDS,
+                    scope={"type": "chat", "chat_id": int(chat_id)},
+                )
+            except Exception as e:
+                logger.warning(f"Telegram bot: failed to set admin commands for {chat_id}: {e}")
+    logger.info("Telegram bot: command menu configured.")
+
+
 async def _run_bot(token: str, services: dict):
     offset = 0
     logger.info("Telegram bot started (raw httpx polling).")
@@ -488,6 +521,11 @@ async def _run_bot(token: str, services: dict):
             logger.error(f"Telegram bot: invalid token or API error: {me}")
             return
         logger.info(f"Telegram bot logged in as @{me['result']['username']}")
+
+        try:
+            await _setup_commands(api, services)
+        except Exception as e:
+            logger.warning(f"Telegram bot: failed to set command menu: {e}")
 
         while True:
             try:
