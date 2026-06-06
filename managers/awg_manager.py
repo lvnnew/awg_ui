@@ -138,8 +138,11 @@ class AWGManager:
         if protocol_type in self._layout_cache:
             return self._layout_cache[protocol_type]
 
-        # Defaults for new-style AWG / AWG2.
-        layout = {'config': 'awg0.conf', 'wg': 'awg', 'quick': 'awg-quick', 'iface': 'awg0'}
+        # AWG2 uses awg-go; plain AWG defaults to wg0 (Amnezia app style).
+        if protocol_type == self.AWG2:
+            layout = {'config': 'awg0.conf', 'wg': 'awg', 'quick': 'awg-quick', 'iface': 'awg0'}
+        else:
+            layout = {'config': 'wg0.conf', 'wg': 'wg', 'quick': 'wg-quick', 'iface': 'wg0'}
 
         if protocol_type == self.AWG:
             container = self._container_name(protocol_type)
@@ -185,9 +188,25 @@ class AWGManager:
 
     def _docker_image(self, protocol_type):
         """Get Docker image for protocol type."""
-        if protocol_type in (self.AWG, self.AWG2):
+        # AWG 2.0 uses awg-go; plain AWG matches the Amnezia client app layout
+        # (wg0.conf + wg binary) for broad client compatibility (iOS/macOS).
+        if protocol_type == self.AWG2:
             return 'amneziavpn/amneziawg-go:latest'
         return 'amneziavpn/amnezia-wg:latest'
+
+    def _server_subnet(self, protocol_type):
+        """Server-side WireGuard interface address (CIDR)."""
+        if protocol_type == self.AWG2:
+            return AWG_DEFAULTS['subnet_ip']
+        return AWG_DEFAULTS['subnet_address']
+
+    def _skip_client_obfuscation_key(self, protocol_type, config_key):
+        """Keys omitted from client configs on compatible AWG layouts."""
+        if protocol_type == self.AWG2:
+            return False
+        if protocol_type in (self.AWG, self.AWG_LEGACY):
+            return config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS')
+        return False
 
     def _clients_table_path(self):
         """Path to the clients table file inside container."""
@@ -282,7 +301,7 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             port = AWG_DEFAULTS['port']
 
         if awg_params is None:
-            awg_params = generate_awg_params(use_ranges=(protocol_type in (self.AWG, self.AWG2)))
+            awg_params = generate_awg_params(use_ranges=(protocol_type == self.AWG2))
 
         container_name = self._container_name(protocol_type)
         docker_image = self._docker_image(protocol_type)
@@ -422,11 +441,11 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         wg_bin = self._wg_binary(protocol_type)
         config_path = self._config_path(protocol_type)
 
-        subnet_ip = AWG_DEFAULTS['subnet_ip']
+        subnet_ip = self._server_subnet(protocol_type)
         subnet_cidr = AWG_DEFAULTS['subnet_cidr']
 
         # Build the server config generation script
-        if protocol_type in (self.AWG, self.AWG2):
+        if protocol_type == self.AWG2:
             config_script = f"""
 mkdir -p /opt/amnezia/awg
 cd /opt/amnezia/awg
@@ -506,7 +525,7 @@ EOF
         container_name = self._container_name(protocol_type)
         quick_bin = self._quick_binary(protocol_type)
         config_path = self._config_path(protocol_type)
-        subnet_ip = AWG_DEFAULTS['subnet_ip']
+        subnet_ip = self._server_subnet(protocol_type)
         subnet_cidr = AWG_DEFAULTS['subnet_cidr']
 
         start_script = f"""#!/bin/bash
@@ -959,8 +978,7 @@ AllowedIPs = {client_ip}/32
         for param_key, config_key in mapping:
             val = awg_params.get(param_key)
             if val:
-                # Basic compatibility filtering
-                if protocol_type == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
+                if self._skip_client_obfuscation_key(protocol_type, config_key):
                     continue
                 config_lines.append(f"{config_key} = {val}")
 
@@ -1051,8 +1069,7 @@ PersistentKeepalive = 25
         for param_key, config_key in mapping:
             val = awg_params.get(param_key)
             if val:
-                # Basic compatibility filtering
-                if protocol_type == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
+                if self._skip_client_obfuscation_key(protocol_type, config_key):
                     continue
                 config_lines.append(f"{config_key} = {val}")
 
