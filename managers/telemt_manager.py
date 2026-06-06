@@ -257,7 +257,42 @@ docker compose version
         m = re.search(r'^\s*public_host\s*=\s*"([^"]+)"', config_text, re.MULTILINE)
         if m: params['public_host'] = m.group(1)
 
+        m = re.search(r'^\s*public_port\s*=\s*(\d+)', config_text, re.MULTILINE)
+        if m: params['public_port'] = m.group(1)
+
         return params
+
+    def _build_proxy_link(self, secret, config_text=None):
+        """Build a working tg://proxy link locally from config.toml.
+
+        Why local (not the API): the telemt container ships without `curl`, so
+        the `docker exec ... curl` API calls silently fail and we'd fall back to
+        a plain-secret IP link. But the proxy runs FakeTLS-only (tls=true), which
+        rejects plain secrets — hence "doesn't connect". For FakeTLS the secret
+        must be `ee` + <16-byte secret hex> + <hex(tls_domain)>, and the link host
+        must be public_host (the domain, if configured)."""
+        if config_text is None:
+            config_text = self._get_server_config()
+        params = self._parse_telemt_params(config_text)
+
+        host = params.get('public_host') or self.ssh.host
+        port = params.get('public_port') or '443'
+
+        secret = (secret or '').strip()
+        # Strip any pre-existing FakeTLS prefix to avoid double "ee".
+        if secret.startswith('ee') or secret.startswith('dd'):
+            secret_core = secret[2:]
+        else:
+            secret_core = secret
+
+        tls = params.get('tls_emulation', True)
+        if tls:
+            domain = params.get('tls_domain') or 'petrovich.ru'
+            link_secret = 'ee' + secret_core + domain.encode('utf-8').hex()
+        else:
+            link_secret = secret_core
+
+        return f"tg://proxy?server={host}&port={port}&secret={link_secret}"
 
     def remove_container(self, protocol_type=None):
         self.ssh.run_sudo_command(f"docker rm -f {self.CONTAINER_NAME}")
@@ -556,17 +591,26 @@ docker compose version
             self.ssh.run_sudo_command(f"docker kill -s HUP {self.CONTAINER_NAME} || docker restart {self.CONTAINER_NAME}")
 
     def get_client_config(self, protocol_type, client_id, host='', port=''):
+        # Prefer the secret straight from config and build the link locally,
+        # because the in-container API (curl) is unavailable and the proxy is
+        # FakeTLS-only. See _build_proxy_link for details.
+        config_text = self._get_server_config()
+        users = self._parse_users_from_config(config_text)
+        secret = users.get(client_id) or users.get(f"# {client_id}")
+        if not secret:
+            # Match ignoring the comment/disabled prefix.
+            for uname, usecret in users.items():
+                if uname.lstrip('#').strip() == client_id:
+                    secret = usecret
+                    break
+        if secret:
+            return self._build_proxy_link(secret, config_text)
+
+        # Last resort: API (works only if a future image bundles curl).
         resp = self._api_request("GET", f"/v1/users/{client_id}")
         if resp and resp.get('ok'):
-            user = resp.get('data', {})
-            links = user.get('links', {})
-            if links.get('tls'): return links['tls'][0]
-            if links.get('secure'): return links['secure'][0]
-            if links.get('classic'): return links['classic'][0]
-            
-        clients = self.get_clients(protocol_type)
-        c = next((c for c in clients if c['clientId'] == client_id), None)
-        if c:
-            secret = c.get('userData', {}).get('token', '')
-            if secret: return f"tg://proxy?server={host}&port={port}&secret={secret}"
+            links = resp.get('data', {}).get('links', {})
+            for k in ('tls', 'secure', 'classic'):
+                if links.get(k):
+                    return links[k][0]
         return "Not found"
