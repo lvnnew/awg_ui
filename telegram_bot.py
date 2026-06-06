@@ -349,7 +349,7 @@ async def _create_and_send(api: TelegramAPI, chat_id: int, tg_id: str, server_id
     data = services["load_data"]()
     servers = data.get("servers", [])
     server = servers[server_id] if server_id < len(servers) else {}
-    await _send_config(api, chat_id, name, server, proto, res.get("config", ""), res.get("vpn_link", ""))
+    await _send_config(api, chat_id, name, server, proto, res.get("config", ""))
     await api.send_message(chat_id, "Готово. Создать ещё или открыть список?", reply_markup=_main_menu_keyboard())
 
 
@@ -414,14 +414,13 @@ async def _handle_get_existing_config(api: TelegramAPI, chat_id: int, callback_i
         return
     if loading_id:
         await api.call("deleteMessage", chat_id=chat_id, message_id=loading_id)
-    vpn_link = services["generate_vpn_link"](config) if config else ""
-    await _send_config(api, chat_id, name, server, proto, config, vpn_link)
+    await _send_config(api, chat_id, name, server, proto, config)
 
 
 # ----------------------------------------------------------------------- #
 #  Shared config sender
 # ----------------------------------------------------------------------- #
-async def _send_config(api: TelegramAPI, chat_id: int, name: str, server: dict, proto: str, config: str, vpn_link: str):
+async def _send_config(api: TelegramAPI, chat_id: int, name: str, server: dict, proto: str, config: str):
     server_name = _server_label(server)
     await api.send_message(
         chat_id,
@@ -435,19 +434,31 @@ async def _send_config(api: TelegramAPI, chat_id: int, name: str, server: dict, 
         await api.send_message(chat_id, f"🔗 <b>Ссылка для подключения</b> (нажми, чтобы скопировать):\n<code>{config}</code>")
         return
 
+    # AWG / WireGuard — отдаём ТОЛЬКО «Оригинальный формат AmneziaWG» (.conf).
+    # Это нативный WireGuard-конфиг с параметрами J/S1-S4/H1-H4, который корректно
+    # работает на iPhone, Mac, Android, Windows и роутерах. Формат vpn:// («для
+    # приложения AmneziaVPN») сознательно НЕ отправляем — он не работает в нативном
+    # AmneziaWG-клиенте и ломается на iOS/macOS (баг S3/S4 в приложении).
     MAX_LEN = 4000
     if len(config) <= MAX_LEN:
-        await api.send_message(chat_id, f"<b>📄 Конфигурация:</b>\n<pre>{config}</pre>")
+        await api.send_message(chat_id, f"<b>📄 Конфигурация (Оригинальный формат AmneziaWG):</b>\n<pre>{config}</pre>")
     else:
         chunks = [config[i:i + MAX_LEN] for i in range(0, len(config), MAX_LEN)]
         for i, chunk in enumerate(chunks, 1):
             await api.send_message(chat_id, f"<b>📄 Конфигурация (часть {i}/{len(chunks)}):</b>\n<pre>{chunk}</pre>")
 
-    if vpn_link:
-        await api.send_message(chat_id, f"🔗 <b>VPN-ссылка для приложения Amnezia</b> (нажми, чтобы скопировать):\n<code>{vpn_link}</code>")
-
     filename = f"{name.replace(' ', '_')}.conf"
-    await api.send_document(chat_id, filename=filename, content=config.encode("utf-8"), caption=f"📁 Файл конфига: {name}")
+    await api.send_document(
+        chat_id, filename=filename, content=config.encode("utf-8"),
+        caption=f"📁 {name} — Оригинальный формат AmneziaWG",
+    )
+    await api.send_message(
+        chat_id,
+        "📲 <b>Как подключить:</b>\n"
+        "1. Установи приложение <b>AmneziaVPN</b> или <b>AmneziaWG</b>.\n"
+        "2. Импортируй этот <b>.conf</b>-файл (или скопируй текст конфигурации выше).\n\n"
+        "ℹ️ Это «Оригинальный формат AmneziaWG» — он корректно работает на iPhone, Mac, Android и Windows.",
+    )
 
 
 # ----------------------------------------------------------------------- #
