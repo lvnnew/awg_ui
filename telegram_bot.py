@@ -143,6 +143,7 @@ def _main_menu_keyboard() -> dict:
         "inline_keyboard": [
             [{"text": "➕ Новое устройство / конфиг", "callback_data": "new"}],
             [{"text": "📂 Мои конфиги", "callback_data": "mine"}],
+            [{"text": "📊 Статус серверов", "callback_data": "status"}],
         ]
     }
 
@@ -418,6 +419,46 @@ async def _handle_get_existing_config(api: TelegramAPI, chat_id: int, callback_i
 
 
 # ----------------------------------------------------------------------- #
+#  Server status
+# ----------------------------------------------------------------------- #
+async def _show_status(api: TelegramAPI, chat_id: int, message_id: Optional[int], tg_id: str, services: dict):
+    panel_user = _find_user(services["load_data"], tg_id)
+    if not panel_user:
+        await _show_welcome_for_new(api, chat_id, tg_id, "")
+        return
+
+    get_status = services.get("get_servers_status")
+    statuses = await asyncio.to_thread(get_status) if get_status else []
+
+    if not statuses:
+        text = "Серверов пока нет."
+    else:
+        online_n = sum(1 for s in statuses if s.get("online"))
+        lines = [f"<b>📊 Статус серверов</b> ({online_n}/{len(statuses)} онлайн)\n"]
+        for s in statuses:
+            if s.get("online"):
+                ping = s.get("ping_ms")
+                ping_txt = f"{ping} ms" if ping is not None else "—"
+                icon = "🟢" if (ping is None or ping < 200) else "🟡"
+                lines.append(f"{icon} <b>{s['name']}</b> — {ping_txt}")
+            else:
+                lines.append(f"🔴 <b>{s['name']}</b> — недоступен")
+            protos = ", ".join(_proto_label(p) for p in s.get("protocols", []) if p not in _NON_VPN_PROTOCOLS)
+            if protos:
+                lines.append(f"    <i>{protos}</i>")
+        text = "\n".join(lines)
+
+    kb = {"inline_keyboard": [
+        [{"text": "🔄 Обновить", "callback_data": "status"}],
+        [{"text": "⬅️ Меню", "callback_data": "menu"}],
+    ]}
+    if message_id:
+        await api.edit_message(chat_id, message_id, text, reply_markup=kb)
+    else:
+        await api.send_message(chat_id, text, reply_markup=kb)
+
+
+# ----------------------------------------------------------------------- #
 #  Shared config sender
 # ----------------------------------------------------------------------- #
 async def _send_config(api: TelegramAPI, chat_id: int, name: str, server: dict, proto: str, config: str):
@@ -623,6 +664,9 @@ async def _dispatch(api: TelegramAPI, update: dict, services: dict):
         elif data_str == "mine":
             await api.answer_callback(callback_id)
             await _show_my_connections(api, chat_id, message_id, tg_id, services)
+        elif data_str == "status":
+            await api.answer_callback(callback_id, "Проверяю серверы…")
+            await _show_status(api, chat_id, message_id, tg_id, services)
         elif data_str.startswith("srv:"):
             await api.answer_callback(callback_id)
             await _show_protocols(api, chat_id, message_id, int(data_str[4:]), services)
@@ -634,8 +678,10 @@ async def _dispatch(api: TelegramAPI, update: dict, services: dict):
             await api.answer_callback(callback_id, "Создаю…")
             _, sid, proto = data_str.split(":", 2)
             _pending.pop(tg_id, None)
-            # Base "Device"; the backend guarantees a globally unique final name.
-            await _create_and_send(api, chat_id, tg_id, int(sid), proto, "Device", services)
+            # Inherently-unique auto name (random suffix); backend dedups as a safety net.
+            import secrets
+            auto_name = f"Device-{secrets.token_hex(2)}"
+            await _create_and_send(api, chat_id, tg_id, int(sid), proto, auto_name, services)
         elif data_str.startswith("cfg:"):
             await _handle_get_existing_config(api, chat_id, callback_id, data_str[4:], tg_id, services)
         else:

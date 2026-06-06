@@ -369,7 +369,40 @@ def bot_services() -> dict:
         'create_user_connection': create_user_connection,
         'get_client_config': get_client_config_for_connection,
         'create_invite_codes': create_invite_codes_for_bot,
+        'get_servers_status': get_servers_status,
     }
+
+
+def get_servers_status() -> list:
+    """Quick reachability + latency check for every server, used by the bot's
+    'Status' button. Uses a parallel TCP connect to the SSH port (fast, no auth,
+    no ICMP perms needed). Blocking — bot must call via asyncio.to_thread."""
+    import socket, time, concurrent.futures
+    data = load_data()
+    servers = data.get('servers', [])
+
+    def probe(s):
+        host = s.get('host')
+        port = int(s.get('ssh_port', 22) or 22)
+        online, ping_ms = False, None
+        try:
+            start = time.monotonic()
+            with socket.create_connection((host, port), timeout=5):
+                ping_ms = round((time.monotonic() - start) * 1000)
+                online = True
+        except Exception:
+            pass
+        return {
+            'name': s.get('name') or host,
+            'online': online,
+            'ping_ms': ping_ms,
+            'protocols': [p for p in s.get('protocols', {}).keys()],
+        }
+
+    if not servers:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(servers), 10)) as ex:
+        return list(ex.map(probe, servers))
 
 
 def create_invite_codes_for_bot(count: int = 1, max_uses: int = 1, note: str = '', created_by: str = 'bot') -> list:
