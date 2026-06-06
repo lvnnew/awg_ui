@@ -16,6 +16,10 @@ from typing import Optional, Callable
 import httpx
 
 logger = logging.getLogger(__name__)
+# Avoid leaking Telegram bot tokens in access logs: httpx logs request URLs
+# at INFO level, and Bot API URLs include the token in the path.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ----------------------------------------------------------------------- #
 #  Global state
