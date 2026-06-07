@@ -372,6 +372,40 @@ def create_user_connection(user_id: str, server_id: int, protocol: str, name: st
     return out
 
 
+def delete_user_connection(user_id: str, conn_id: str) -> dict:
+    """Delete a user's OWN connection: removes the peer on the server, then drops
+    the stored record. Ownership-checked. If the server is unreachable we keep the
+    record (don't orphan a still-working peer). Blocking — call via to_thread."""
+    data = load_data()
+    conn = next((c for c in data.get('user_connections', []) if c.get('id') == conn_id), None)
+    if not conn:
+        return {'error': 'not_found'}
+    if conn.get('user_id') != user_id:
+        return {'error': 'forbidden'}
+
+    servers = data.get('servers', [])
+    sid = conn.get('server_id', 0)
+    if 0 <= sid < len(servers):
+        server = servers[sid]
+        try:
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                manager = get_protocol_manager(ssh, conn['protocol'])
+                _manager_call(manager, 'remove_client', conn['protocol'], conn['client_id'])
+            finally:
+                ssh.disconnect()
+        except Exception:
+            logger.exception("delete_user_connection: failed to remove peer on server")
+            return {'error': 'server_error'}
+
+    # Reload to avoid clobbering concurrent writes, then drop the record.
+    data = load_data()
+    data['user_connections'] = [c for c in data.get('user_connections', []) if c.get('id') != conn_id]
+    save_data(data)
+    return {'status': 'success', 'name': conn.get('name', '')}
+
+
 def bot_services() -> dict:
     """Capabilities injected into the Telegram bot so it can self-register users
     and provision connections without importing app internals (avoids cycles)."""
@@ -380,6 +414,7 @@ def bot_services() -> dict:
         'generate_vpn_link': generate_vpn_link,
         'register_user_with_code': register_user_with_code,
         'create_user_connection': create_user_connection,
+        'delete_user_connection': delete_user_connection,
         'get_client_config': get_client_config_for_connection,
         'create_invite_codes': create_invite_codes_for_bot,
         'get_servers_status': get_servers_status,

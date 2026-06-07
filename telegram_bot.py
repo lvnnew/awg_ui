@@ -333,7 +333,10 @@ def _build_connections_keyboard(conns: list, data: dict) -> dict:
         proto = _proto_label(c.get("protocol", ""))
         name = c.get("name", "Connection")
         label = f"🔐 {name} · {proto} · {server_name}"
-        rows.append([{"text": label, "callback_data": f"cfg:{c['id']}"}])
+        rows.append([
+            {"text": label, "callback_data": f"cfg:{c['id']}"},
+            {"text": "🗑", "callback_data": f"del:{c['id']}"},
+        ])
     rows.append([{"text": "🔄 Обновить", "callback_data": "mine"}])
     rows.append([{"text": "⬅️ Меню", "callback_data": "menu"}])
     return {"inline_keyboard": rows}
@@ -663,6 +666,63 @@ async def _handle_get_existing_config(api: TelegramAPI, chat_id: int, callback_i
     if loading_id:
         await api.call("deleteMessage", chat_id=chat_id, message_id=loading_id)
     await _send_config(api, chat_id, name, server, proto, config)
+
+
+async def _confirm_delete(api: TelegramAPI, chat_id: int, callback_id: str, message_id: Optional[int], conn_id: str, tg_id: str, services: dict):
+    """Step 1: ask the user to confirm deleting one of their own connections."""
+    await api.answer_callback(callback_id)
+    panel_user = _find_user(services["load_data"], tg_id)
+    if not panel_user:
+        await api.send_message(chat_id, "❌ Доступ запрещён.")
+        return
+    data = services["load_data"]()
+    conn = next(
+        (c for c in data.get("user_connections", [])
+         if c["id"] == conn_id and c["user_id"] == panel_user["id"]),
+        None,
+    )
+    if not conn:
+        await _show_my_connections(api, chat_id, message_id, tg_id, services)
+        return
+    name = html.escape(conn.get("name", "конфиг"))
+    kb = {"inline_keyboard": [[
+        {"text": "✅ Да, удалить", "callback_data": f"delok:{conn_id}"},
+        {"text": "↩️ Отмена", "callback_data": "mine"},
+    ]]}
+    text = (
+        f"🗑 Удалить «<b>{name}</b>»?\n\n"
+        "Устройство перестанет подключаться к VPN. Действие необратимо."
+    )
+    if message_id:
+        await api.edit_message(chat_id, message_id, text, reply_markup=kb)
+    else:
+        await api.send_message(chat_id, text, reply_markup=kb)
+
+
+async def _do_delete(api: TelegramAPI, chat_id: int, callback_id: str, message_id: Optional[int], conn_id: str, tg_id: str, services: dict):
+    """Step 2: actually remove the peer on the server and drop the record."""
+    await api.answer_callback(callback_id, "Удаляю…")
+    panel_user = _find_user(services["load_data"], tg_id)
+    if not panel_user:
+        await api.send_message(chat_id, "❌ Доступ запрещён.")
+        return
+    delete_fn = services.get("delete_user_connection")
+    if not delete_fn:
+        await api.send_message(chat_id, "❌ Удаление сейчас недоступно.")
+        return
+    res = await asyncio.to_thread(delete_fn, panel_user["id"], conn_id)
+    if res.get("error"):
+        msg = {
+            "not_found": "Конфиг не найден.",
+            "forbidden": "Это не твой конфиг.",
+            "server_error": "Сервер недоступен, попробуй позже.",
+        }.get(res["error"], f"Ошибка: {res['error']}")
+        await api.send_message(chat_id, f"❌ {msg}")
+        await _show_my_connections(api, chat_id, message_id, tg_id, services)
+        return
+    await _show_my_connections(api, chat_id, message_id, tg_id, services)
+    deleted = html.escape(res.get("name", "") or "конфиг")
+    await api.send_message(chat_id, f"🗑 Готово, «<b>{deleted}</b>» удалён.")
 
 
 # ----------------------------------------------------------------------- #
@@ -1000,5 +1060,9 @@ async def _dispatch(api: TelegramAPI, update: dict, services: dict):
             await _create_and_send(api, chat_id, tg_id, int(sid), proto, auto_name, services)
         elif data_str.startswith("cfg:"):
             await _handle_get_existing_config(api, chat_id, callback_id, data_str[4:], tg_id, services)
+        elif data_str.startswith("delok:"):
+            await _do_delete(api, chat_id, callback_id, message_id, data_str[6:], tg_id, services)
+        elif data_str.startswith("del:"):
+            await _confirm_delete(api, chat_id, callback_id, message_id, data_str[4:], tg_id, services)
         else:
             await api.answer_callback(callback_id)
