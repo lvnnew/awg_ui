@@ -51,8 +51,14 @@
             <form id="telegramForm">
                 <div class="form-group">
                     <label class="form-label">{{ _('bot_token_label') }}</label>
-                    <input type="text" class="form-input" id="tg_token" value="{{ telegram_settings.token or '' }}"
-                        placeholder="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11">
+                    <div style="display:flex; gap: var(--space-sm); align-items:center;">
+                        <input type="password" class="form-input" id="tg_token" value="{{ telegram_settings.token or '' }}"
+                            placeholder="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+                            autocomplete="off" style="flex:1;">
+                        <button type="button" class="btn btn-secondary btn-sm" id="tgTokenToggle"
+                            onclick="toggleTokenVisibility()" title="Показать / скрыть токен"
+                            style="white-space:nowrap;">👁 Показать</button>
+                    </div>
                 </div>
                 <div style="display: flex; align-items: center; gap: var(--space-md); margin-top: var(--space-md);">
                     <div style="display: flex; align-items: center; gap: var(--space-sm);">
@@ -604,6 +610,18 @@
         } finally {
             btn.disabled = false;
             spinner.classList.add('hidden');
+        }
+    }
+
+    function toggleTokenVisibility() {
+        const input = document.getElementById('tg_token');
+        const btn = document.getElementById('tgTokenToggle');
+        if (input.type === 'password') {
+            input.type = 'text';
+            btn.textContent = '🙈 Скрыть';
+        } else {
+            input.type = 'password';
+            btn.textContent = '👁 Показать';
         }
     }
 
