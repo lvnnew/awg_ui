@@ -364,19 +364,57 @@ def _welcome_text(first_name: str) -> str:
     )
 
 
-def _help_text(username: Optional[str] = None) -> str:
+# Short, user-facing protocol blurbs. Keyed by the canonical protocol group
+# (awg variants collapse into one "awg" entry). Order here = display order.
+_PROTO_HELP = {
+    "awg": "<b>AmneziaWG</b> — основной. Маскируется под обычный трафик, обходит "
+           "блокировки, работает на всех устройствах (iPhone/Mac/Android/Windows). "
+           "Нужен клиент AmneziaWG или AmneziaVPN.",
+    "xray": "<b>XRay / VLESS</b> — запасной, если AmneziaWG не подключается в жёсткой сети.",
+    "telemt": "<b>Telemt</b> — прокси только для Telegram (не VPN). Разблокирует сам "
+              "мессенджер: нажми «Применить».",
+    "wireguard": "<b>WireGuard</b> — классический WG: быстрый, но маскируется слабее AWG.",
+    "socks5": "<b>SOCKS5</b> — лёгкий прокси для отдельного приложения или браузера.",
+}
+
+
+def _available_protocols(load_data_fn: Callable) -> list:
+    """Canonical protocol groups actually installed across the fleet, in
+    _PROTO_HELP display order. AWG variants collapse into one 'awg' entry."""
+    present = set()
+    try:
+        for srv in load_data_fn().get("servers", []):
+            for p in (srv.get("protocols") or {}):
+                if p in ("awg", "awg2", "awg_legacy"):
+                    present.add("awg")
+                elif p in _PROTO_HELP:
+                    present.add(p)
+    except Exception as e:
+        logger.warning(f"_available_protocols failed: {e}")
+    return [p for p in _PROTO_HELP if p in present]
+
+
+def _help_text(username: Optional[str] = None, services: Optional[dict] = None) -> str:
     intro = "✅ Ты в системе.\n\n"
     if username:
         intro = f"✅ Ты в системе как <b>{username}</b>.\n\n"
-    return (
+    text = (
         intro +
         "Как пользоваться:\n"
         "➕ «Новое устройство / конфиг» — создать конфиг (сервер → протокол → имя).\n"
         "📂 «Мои конфиги» — список твоих конфигов и их выдача.\n"
-        "📊 «Статус серверов» — доступность и пинг.\n\n"
-        "⚠️ Помни: <b>один конфиг = одно устройство</b>. "
+        "📊 «Статус серверов» — доступность и пинг.\n"
+    )
+    if services and services.get("load_data"):
+        keys = _available_protocols(services["load_data"])
+        if keys:
+            text += "\n🔌 <b>Протоколы — что выбрать:</b>\n"
+            text += "\n".join(f"• {_PROTO_HELP[k]}" for k in keys) + "\n"
+    text += (
+        "\n⚠️ Помни: <b>один конфиг = одно устройство</b>. "
         "Не передавай свои конфиги другим — у каждого должен быть свой код."
     )
+    return text
 
 
 async def _show_welcome_for_new(api: TelegramAPI, chat_id: int, tg_id: str, first_name: str):
@@ -399,7 +437,7 @@ async def _try_register(api: TelegramAPI, chat_id: int, tg_id: str, first_name: 
         chat_id,
         f"🎉 Регистрация прошла успешно!\n"
         f"Твой логин в системе: <b>{res.get('username')}</b>.\n\n"
-        + _help_text(),
+        + _help_text(services=services),
         reply_markup=_main_menu_keyboard(),
     )
 
@@ -454,7 +492,7 @@ async def _show_help(api: TelegramAPI, chat_id: int, message_id: Optional[int], 
     if not panel_user:
         await _show_welcome_for_new(api, chat_id, tg_id, "")
         return
-    text = _help_text(panel_user.get("username"))
+    text = _help_text(panel_user.get("username"), services=services)
     if message_id:
         await api.edit_message(chat_id, message_id, text, reply_markup=_main_menu_keyboard())
     else:
@@ -643,19 +681,25 @@ async def _show_status(api: TelegramAPI, chat_id: int, message_id: Optional[int]
         text = "Серверов пока нет."
     else:
         online_n = sum(1 for s in statuses if s.get("online"))
-        lines = [f"<b>📊 Статус серверов</b> ({online_n}/{len(statuses)} онлайн)\n"]
+        header = f"<b>📊 Статус серверов</b> · {online_n}/{len(statuses)} онлайн"
+        blocks = []
         for s in statuses:
+            name = html.escape(str(s.get("name", "—")))
             if s.get("online"):
                 ping = s.get("ping_ms")
                 ping_txt = f"{ping} ms" if ping is not None else "—"
                 icon = "🟢" if (ping is None or ping < 200) else "🟡"
-                lines.append(f"{icon} <b>{s['name']}</b> — {ping_txt}")
+                head = f"{icon} <b>{name}</b> — {ping_txt}"
             else:
-                lines.append(f"🔴 <b>{s['name']}</b> — недоступен")
-            protos = ", ".join(_proto_label(p) for p in s.get("protocols", []) if p not in _NON_VPN_PROTOCOLS)
-            if protos:
-                lines.append(f"    <i>{protos}</i>")
-        text = "\n".join(lines)
+                head = f"🔴 <b>{name}</b> — недоступен"
+            protos = " · ".join(
+                html.escape(_proto_label(p))
+                for p in s.get("protocols", []) if p not in _NON_VPN_PROTOCOLS
+            )
+            block = head + (f"\n   <i>{protos}</i>" if protos else "")
+            blocks.append(block)
+        # Blank line between servers ("воздух") for readability.
+        text = header + "\n\n" + "\n\n".join(blocks)
 
     kb = {"inline_keyboard": [
         [{"text": "🔄 Обновить", "callback_data": "status"}],
