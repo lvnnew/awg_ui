@@ -75,6 +75,45 @@
             </form>
         </div>
 
+        <!-- BLOCK: Notifications / Broadcast -->
+        <div class="card">
+            <h3 class="card-title" style="margin-bottom: var(--space-lg);">📢 Уведомления</h3>
+
+            <div class="form-group">
+                <label class="form-label" style="display:flex; align-items:center; gap:8px;">
+                    <input type="checkbox" id="notifServerEvents" onchange="saveNotifSettings()">
+                    Автоуведомления о серверах и протоколах
+                </label>
+                <p class="form-hint" style="margin-top: var(--space-xs);">
+                    Всем пользователям бота автоматически уходит сообщение, когда:
+                    добавлен / удалён сервер, установлен / удалён протокол.
+                    Служебные протоколы (DNS, AdGuard) не рассылаются.
+                </p>
+            </div>
+
+            <hr style="border:none; border-top:1px solid var(--border-color); margin: var(--space-md) 0;">
+
+            <div class="form-group">
+                <label class="form-label">Ручная рассылка</label>
+                <textarea class="form-input" id="broadcastText" rows="4"
+                    placeholder="Например: Завтра с 02:00 до 03:00 МСК плановые работы, возможны короткие перебои."></textarea>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top: var(--space-sm);">
+                <select class="form-input" id="broadcastAudience" style="width:auto;">
+                    <option value="all">Всем пользователям</option>
+                    <option value="admins">Только админам</option>
+                </select>
+                <button type="button" class="btn btn-primary" onclick="sendBroadcast()" id="broadcastBtn">
+                    <span id="broadcastBtnText">Отправить</span>
+                    <div class="spinner hidden" id="broadcastSpinner" style="width:14px;height:14px;"></div>
+                </button>
+            </div>
+            <p class="form-hint" style="margin-top: var(--space-sm);">
+                Сообщение отправится в личные чаты бота. Получат только пользователи с привязанным Telegram,
+                которые уже запускали бота. Можно также из бота: <code>/broadcast текст</code> (для админа).
+            </p>
+        </div>
+
         <!-- BLOCK 4: API Docs -->
         <div class="card">
             <h3 class="card-title" style="margin-bottom: var(--space-lg);">{{ _('api_docs_title') }}</h3>
@@ -853,5 +892,62 @@
     }
 
     document.addEventListener('DOMContentLoaded', loadInviteCodes);
+
+    /* ========== Notifications / Broadcast ========== */
+    async function loadNotifSettings() {
+        try {
+            const res = await fetch('/api/notifications/settings');
+            const data = await res.json();
+            const el = document.getElementById('notifServerEvents');
+            if (el) el.checked = !!(data.notifications && data.notifications.server_events);
+        } catch (err) { /* non-critical */ }
+    }
+
+    async function saveNotifSettings() {
+        const server_events = document.getElementById('notifServerEvents').checked;
+        try {
+            const res = await fetch('/api/notifications/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ server_events }),
+            });
+            if (res.ok) showToast('Настройки уведомлений сохранены', 'success');
+            else showToast('Не удалось сохранить', 'error');
+        } catch (err) { showToast(err.message, 'error'); }
+    }
+
+    async function sendBroadcast() {
+        const text = document.getElementById('broadcastText').value.trim();
+        const audience = document.getElementById('broadcastAudience').value;
+        if (!text) { showToast('Введите текст сообщения', 'error'); return; }
+        if (!confirm('Отправить уведомление ' + (audience === 'admins' ? 'админам' : 'всем пользователям') + '?')) return;
+        const btn = document.getElementById('broadcastBtn');
+        const txt = document.getElementById('broadcastBtnText');
+        const spin = document.getElementById('broadcastSpinner');
+        btn.disabled = true; txt.classList.add('hidden'); spin.classList.remove('hidden');
+        try {
+            const res = await fetch('/api/notifications/broadcast', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text, audience }),
+            });
+            const data = await res.json();
+            if (res.ok && data.status === 'success') {
+                let msg = 'Доставлено ' + data.sent + ' из ' + data.total;
+                if (data.blocked) msg += ', заблокировали: ' + data.blocked;
+                if (data.failed) msg += ', ошибок: ' + data.failed;
+                showToast(msg, 'success');
+                document.getElementById('broadcastText').value = '';
+            } else {
+                showToast(data.error || 'Ошибка рассылки', 'error');
+            }
+        } catch (err) {
+            showToast(err.message, 'error');
+        } finally {
+            btn.disabled = false; txt.classList.remove('hidden'); spin.classList.add('hidden');
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', loadNotifSettings);
 </script>
 {% endblock %}

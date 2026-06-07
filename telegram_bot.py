@@ -10,6 +10,7 @@ This lets friends self-register with an invite code and provision their own
 per-server / per-protocol / per-device configs without admin involvement.
 """
 import asyncio
+import html
 import logging
 from typing import Optional, Callable
 
@@ -25,6 +26,11 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 #  Global state
 # ----------------------------------------------------------------------- #
 _bot_task: Optional[asyncio.Task] = None
+
+# Live reference to the running bot's API client, set while _run_bot is active.
+# Lets the panel push broadcasts through the already-authenticated client; when
+# the bot isn't polling we fall back to an ephemeral client built from the token.
+_bot_api: "Optional[TelegramAPI]" = None
 
 # Per-chat conversation state (single-process bot, in-memory is fine).
 # tg_id -> {"action": "await_code" | "await_name", "server_id": int, "protocol": str}
@@ -95,7 +101,9 @@ class TelegramAPI:
 
     async def send_message(self, chat_id, text: str, reply_markup=None, parse_mode="HTML") -> dict:
         import json
-        params = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+        params = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            params["parse_mode"] = parse_mode
         if reply_markup:
             params["reply_markup"] = json.dumps(reply_markup)
         return (await self.call("sendMessage", **params))
@@ -128,6 +136,151 @@ def _find_user(load_data_fn: Callable, tg_id: str):
         if stored and stored == tg_id_clean:
             return u
     return None
+
+
+# ----------------------------------------------------------------------- #
+#  Broadcast / notifications
+# ----------------------------------------------------------------------- #
+def _recipient_ids(load_data_fn: Callable, audience: str = "all") -> list:
+    """Telegram chat IDs to notify. `audience`: 'all' registered & enabled users,
+    or 'admins' for admin accounts only. Deduplicated, order-preserving."""
+    data = load_data_fn()
+    out, seen = [], set()
+    for u in data.get("users", []):
+        if not u.get("enabled", True):
+            continue
+        if audience == "admins" and u.get("role") != "admin":
+            continue
+        tg = str(u.get("telegramId", "") or "").lstrip("@")
+        if tg and tg not in seen:
+            seen.add(tg)
+            out.append(tg)
+    return out
+
+
+def _as_chat_id(value: str):
+    """Telegram numeric IDs must be ints; @usernames stay as '@name' strings."""
+    v = str(value)
+    if v.lstrip("-").isdigit():
+        return int(v)
+    return v if v.startswith("@") else f"@{v}"
+
+
+async def _send_broadcast(api: "TelegramAPI", recipient_ids: list, text: str, parse_mode=None) -> dict:
+    """Deliver `text` to each chat id, tolerating blocks/limits. Telegram caps
+    bulk sends ~30/s, so we pace lightly and honour 429 retry_after once."""
+    sent = blocked = failed = 0
+    for cid in recipient_ids:
+        try:
+            resp = await api.send_message(_as_chat_id(cid), text, parse_mode=parse_mode)
+            if resp.get("ok"):
+                sent += 1
+            else:
+                code = resp.get("error_code")
+                if code == 429:
+                    retry = resp.get("parameters", {}).get("retry_after", 1)
+                    await asyncio.sleep(retry + 0.5)
+                    resp2 = await api.send_message(_as_chat_id(cid), text, parse_mode=parse_mode)
+                    if resp2.get("ok"):
+                        sent += 1
+                    else:
+                        failed += 1
+                elif code == 403:  # user blocked / never started the bot
+                    blocked += 1
+                else:
+                    failed += 1
+                    logger.warning(f"broadcast to {cid} failed: {resp}")
+        except Exception as e:
+            failed += 1
+            logger.warning(f"broadcast to {cid} error: {e}")
+        await asyncio.sleep(0.05)
+    return {"sent": sent, "blocked": blocked, "failed": failed, "total": len(recipient_ids)}
+
+
+async def broadcast_message(services: dict, text: str, audience: str = "all", parse_mode=None) -> dict:
+    """Send a ready-made message to users. Uses the live bot client if polling,
+    otherwise opens a short-lived client from the saved token."""
+    load_data_fn = services["load_data"]
+    data = load_data_fn()
+    token = data.get("settings", {}).get("telegram", {}).get("token", "")
+    if not token:
+        return {"error": "telegram token not set", "sent": 0, "total": 0}
+
+    ids = _recipient_ids(load_data_fn, audience)
+    if not ids:
+        return {"sent": 0, "blocked": 0, "failed": 0, "total": 0}
+
+    if _bot_api is not None:
+        return await _send_broadcast(_bot_api, ids, text, parse_mode)
+
+    async with httpx.AsyncClient() as client:
+        api = TelegramAPI(token, client)
+        return await _send_broadcast(api, ids, text, parse_mode)
+
+
+async def broadcast_custom(services: dict, raw_text: str, audience: str = "all") -> dict:
+    """Admin-authored announcement. Body is HTML-escaped so arbitrary text can't
+    break Telegram parsing, then wrapped with a recognizable header."""
+    body = html.escape((raw_text or "").strip())
+    if not body:
+        return {"error": "empty text", "sent": 0, "total": 0}
+    text = f"📢 <b>Объявление</b>\n\n{body}"
+    return await broadcast_message(services, text, audience=audience, parse_mode="HTML")
+
+
+async def _notify_infra(services: dict, text: str) -> None:
+    """Send an infrastructure notice to all users if the server_events toggle is
+    on. Fire-and-forget: never raises into the caller."""
+    try:
+        data = services["load_data"]()
+        notif = data.get("settings", {}).get("notifications", {})
+        if not notif.get("server_events", True):
+            return
+        await broadcast_message(services, text, audience="all", parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"_notify_infra failed: {e}")
+
+
+async def notify_server_event(services: dict, kind: str, server_name: str) -> None:
+    """Notice about a server being added/removed."""
+    name = html.escape(server_name or "сервер")
+    if kind == "added":
+        text = (
+            f"🆕 <b>Новый сервер доступен:</b> {name}\n\n"
+            "Открой ➕ «Новое устройство / конфиг», чтобы создать конфиг."
+        )
+    elif kind == "removed":
+        text = (
+            f"🗑 <b>Сервер отключён:</b> {name}\n\n"
+            "Конфиги на этом сервере больше не работают — при необходимости создай новый на другом сервере."
+        )
+    else:
+        return
+    await _notify_infra(services, text)
+
+
+async def notify_protocol_event(services: dict, kind: str, server_name: str, protocol: str) -> None:
+    """Notice about a protocol being installed/removed on a server. Infra-only
+    protocols (DNS/AdGuard) are skipped — users can't make configs for them."""
+    if protocol in _NON_VPN_PROTOCOLS:
+        return
+    name = html.escape(server_name or "сервер")
+    proto = html.escape(_proto_label(protocol))
+    if kind == "installed":
+        text = (
+            f"➕ <b>Новый протокол:</b> {proto}\n"
+            f"Сервер: {name}\n\n"
+            "Можешь создать конфиг через ➕ «Новое устройство / конфиг»."
+        )
+    elif kind == "removed":
+        text = (
+            f"➖ <b>Протокол отключён:</b> {proto}\n"
+            f"Сервер: {name}\n\n"
+            "Конфиги этого протокола на сервере больше не работают."
+        )
+    else:
+        return
+    await _notify_infra(services, text)
 
 
 def _proto_label(proto: str) -> str:
@@ -599,6 +752,35 @@ async def _handle_newcode(api: TelegramAPI, msg: dict, services: dict):
 
 
 # ----------------------------------------------------------------------- #
+#  Admin command: /broadcast — manual announcement to all users
+# ----------------------------------------------------------------------- #
+async def _handle_broadcast(api: TelegramAPI, msg: dict, services: dict):
+    chat_id = msg["chat"]["id"]
+    tg_id = str(msg["from"]["id"])
+    panel_user = _find_user(services["load_data"], tg_id)
+    if not panel_user or panel_user.get("role") != "admin":
+        await api.send_message(chat_id, "❌ Команда доступна только администратору.")
+        return
+    parts = (msg.get("text", "") or "").split(maxsplit=1)
+    body = parts[1].strip() if len(parts) > 1 else ""
+    if not body:
+        await api.send_message(
+            chat_id,
+            "✍️ Напиши текст после команды, например:\n"
+            "<code>/broadcast Завтра плановые работы с 02:00 до 03:00 МСК</code>",
+        )
+        return
+    res = await broadcast_custom(services, body, audience="all")
+    await api.send_message(
+        chat_id,
+        f"📢 Рассылка отправлена.\n"
+        f"Доставлено: <b>{res.get('sent', 0)}</b> из {res.get('total', 0)}"
+        + (f"\nЗаблокировали бота: {res['blocked']}" if res.get("blocked") else "")
+        + (f"\nОшибок: {res['failed']}" if res.get("failed") else ""),
+    )
+
+
+# ----------------------------------------------------------------------- #
 #  Main polling loop
 # ----------------------------------------------------------------------- #
 # Command menu shown by Telegram's "Menu" button.
@@ -609,6 +791,7 @@ _PUBLIC_COMMANDS = [
 ]
 _ADMIN_COMMANDS = _PUBLIC_COMMANDS + [
     {"command": "newcode", "description": "Создать код регистрации (админ)"},
+    {"command": "broadcast", "description": "Рассылка всем пользователям (админ)"},
 ]
 
 
@@ -636,15 +819,18 @@ async def _setup_commands(api: TelegramAPI, services: dict):
 
 
 async def _run_bot(token: str, services: dict):
+    global _bot_api
     offset = 0
     logger.info("Telegram bot started (raw httpx polling).")
 
     async with httpx.AsyncClient() as client:
         api = TelegramAPI(token, client)
+        _bot_api = api
 
         me = await api.call("getMe")
         if not me.get("ok"):
             logger.error(f"Telegram bot: invalid token or API error: {me}")
+            _bot_api = None
             return
         logger.info(f"Telegram bot logged in as @{me['result']['username']}")
 
@@ -653,25 +839,28 @@ async def _run_bot(token: str, services: dict):
         except Exception as e:
             logger.warning(f"Telegram bot: failed to set command menu: {e}")
 
-        while True:
-            try:
-                updates = await api.get_updates(offset=offset, timeout=25)
-            except asyncio.CancelledError:
-                logger.info("Telegram bot polling cancelled.")
-                return
-            except Exception as e:
-                logger.warning(f"Telegram bot polling error: {e}")
-                await asyncio.sleep(5)
-                continue
-
-            for update in updates:
-                offset = update["update_id"] + 1
+        try:
+            while True:
                 try:
-                    await _dispatch(api, update, services)
+                    updates = await api.get_updates(offset=offset, timeout=25)
                 except asyncio.CancelledError:
+                    logger.info("Telegram bot polling cancelled.")
                     return
                 except Exception as e:
-                    logger.exception(f"Telegram bot: error handling update {update['update_id']}: {e}")
+                    logger.warning(f"Telegram bot polling error: {e}")
+                    await asyncio.sleep(5)
+                    continue
+
+                for update in updates:
+                    offset = update["update_id"] + 1
+                    try:
+                        await _dispatch(api, update, services)
+                    except asyncio.CancelledError:
+                        return
+                    except Exception as e:
+                        logger.exception(f"Telegram bot: error handling update {update['update_id']}: {e}")
+        finally:
+            _bot_api = None
 
 
 async def _dispatch(api: TelegramAPI, update: dict, services: dict):
@@ -689,6 +878,9 @@ async def _dispatch(api: TelegramAPI, update: dict, services: dict):
             return
         if text.startswith("/newcode"):
             await _handle_newcode(api, msg, services)
+            return
+        if text.startswith("/broadcast") or text.startswith("/announce"):
+            await _handle_broadcast(api, msg, services)
             return
         if text.startswith("/register"):
             parts = text.split(maxsplit=1)

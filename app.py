@@ -143,7 +143,20 @@ def load_data():
             'remnawave_protocol': 'awg'
         }
     })
+    # Notification preferences (auto-broadcasts to bot users). Added lazily so
+    # existing installs pick up the default without losing other settings.
+    data['settings'].setdefault('notifications', {'server_events': True})
     return data
+
+
+def _notify_bot(coro_factory):
+    """Schedule a fire-and-forget bot notification on the running event loop.
+    Safe to call from any endpoint: never blocks the response and swallows the
+    'no loop' case (e.g. during sync startup)."""
+    try:
+        asyncio.get_running_loop().create_task(coro_factory())
+    except RuntimeError:
+        pass
 
 
 def save_data(data):
@@ -1052,6 +1065,15 @@ class CreateInviteCodeRequest(BaseModel):
     count: int = 1
 
 
+class BroadcastRequest(BaseModel):
+    text: str
+    audience: str = 'all'  # 'all' | 'admins'
+
+
+class NotificationSettingsRequest(BaseModel):
+    server_events: bool = True
+
+
 class ShareSetupRequest(BaseModel):
     enabled: bool
     password: Optional[str] = None
@@ -1464,6 +1486,7 @@ async def api_add_server(request: Request, req: AddServerRequest):
         data = load_data()
         data['servers'].append(server)
         save_data(data)
+        _notify_bot(lambda: tg_bot.notify_server_event(bot_services(), 'added', name))
         return {'status': 'success', 'server_id': len(data['servers']) - 1, 'server_info': server_info}
     except Exception as e:
         logger.exception("Error adding server")
@@ -1599,7 +1622,8 @@ async def api_delete_server(request: Request, server_id: int):
         data = load_data()
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
-        data['servers'].pop(server_id)
+        removed = data['servers'].pop(server_id)
+        removed_name = removed.get('name') or removed.get('host') or 'сервер'
         # Clean up connections for this server
         data['user_connections'] = [c for c in data.get('user_connections', []) if c.get('server_id') != server_id]
         # Adjust server_ids for connections pointing to higher indices
@@ -1607,6 +1631,7 @@ async def api_delete_server(request: Request, server_id: int):
             if c.get('server_id', 0) > server_id:
                 c['server_id'] -= 1
         save_data(data)
+        _notify_bot(lambda: tg_bot.notify_server_event(bot_services(), 'removed', removed_name))
         return {'status': 'success'}
     except Exception as e:
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -1861,6 +1886,8 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         server['protocols'][req.protocol] = proto_record
         save_data(data)
         ssh.disconnect()
+        srv_name = server.get('name') or server.get('host') or 'сервер'
+        _notify_bot(lambda: tg_bot.notify_protocol_event(bot_services(), 'installed', srv_name, req.protocol))
         return result
     except Exception as e:
         logger.exception("Error installing protocol")
@@ -1965,10 +1992,14 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
             manager.remove_container()
         else:
             manager.remove_container(req.protocol)
-        if req.protocol in server.get('protocols', {}):
+        removed_proto = req.protocol in server.get('protocols', {})
+        if removed_proto:
             del server['protocols'][req.protocol]
             save_data(data)
         ssh.disconnect()
+        if removed_proto:
+            srv_name = server.get('name') or server.get('host') or 'сервер'
+            _notify_bot(lambda: tg_bot.notify_protocol_event(bot_services(), 'removed', srv_name, req.protocol))
         return {'status': 'success'}
     except Exception as e:
         logger.exception("Error uninstalling protocol")
@@ -3061,6 +3092,48 @@ async def api_delete_invite_code(request: Request, code: str):
             return JSONResponse({'error': 'Code not found'}, status_code=404)
         save_data(data)
     return {'status': 'success'}
+
+
+@app.get('/api/notifications/settings', tags=["Settings"])
+async def api_get_notification_settings(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    return {'notifications': data.get('settings', {}).get('notifications', {'server_events': True})}
+
+
+@app.post('/api/notifications/settings', tags=["Settings"])
+async def api_set_notification_settings(request: Request, req: NotificationSettingsRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    async with DATA_LOCK:
+        data = load_data()
+        data.setdefault('settings', {})['notifications'] = {'server_events': bool(req.server_events)}
+        save_data(data)
+    return {'status': 'success', 'notifications': {'server_events': bool(req.server_events)}}
+
+
+@app.post('/api/notifications/broadcast', tags=["Settings"])
+async def api_broadcast(request: Request, req: BroadcastRequest):
+    """Send a manual announcement to bot users. Works whether the polling bot is
+    running or not (falls back to an ephemeral client using the saved token)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    text = (req.text or '').strip()
+    if not text:
+        return JSONResponse({'error': 'Текст сообщения пуст'}, status_code=400)
+    audience = req.audience if req.audience in ('all', 'admins') else 'all'
+    data = load_data()
+    if not data.get('settings', {}).get('telegram', {}).get('token'):
+        return JSONResponse({'error': 'Сначала задайте токен бота в настройках Telegram'}, status_code=400)
+    try:
+        result = await tg_bot.broadcast_custom(bot_services(), text, audience=audience)
+    except Exception as e:
+        logger.exception("Broadcast failed")
+        return JSONResponse({'error': str(e)}, status_code=500)
+    if result.get('error'):
+        return JSONResponse({'error': result['error']}, status_code=400)
+    return {'status': 'success', **result}
 
 
 @app.get('/api/settings/backup/download', tags=["Settings"])
