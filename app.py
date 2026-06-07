@@ -1,10 +1,13 @@
 import os
 import sys
 import json
+import copy
 import logging
 import base64
 import hashlib
 import secrets
+import tempfile
+import threading
 import uuid
 import asyncio
 from datetime import datetime, timedelta
@@ -82,8 +85,72 @@ if getattr(sys, 'frozen', False):
 else:
     application_path = os.path.dirname(__file__)
 
-DATA_FILE = os.path.join(application_path, 'data.json')
+DATA_FILE = os.environ.get('DATA_FILE') or os.path.join(application_path, 'data.json')
 CURRENT_VERSION = "v1.4.3"
+
+# Serializes writes to DATA_FILE across threads (asyncio DATA_LOCK only guards
+# coroutines, not the to_thread workers / sync callers that also call save_data).
+_FILE_LOCK = threading.RLock()
+
+# ---- Secret-at-rest encryption -------------------------------------------- #
+# Secrets in data.json (SSH keys/passwords, bot token, API keys, TLS private
+# key) are encrypted with Fernet. The key is derived from SECRET_KEY (the same
+# stable secret used for sessions, provided via the k8s Secret). Encryption is
+# transparent: save_data() encrypts, load_data() decrypts, so the rest of the
+# code keeps working with plaintext values.
+from cryptography.fernet import Fernet, InvalidToken
+
+_ENC_PREFIX = "enc::v1::"
+_SECRET_KEY_ENV = os.environ.get('SECRET_KEY')
+if _SECRET_KEY_ENV:
+    _fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(_SECRET_KEY_ENV.encode()).digest()))
+else:
+    _fernet = None
+    logger.warning("SECRET_KEY not set — secrets in data.json will NOT be encrypted at rest.")
+
+
+def _enc(value):
+    """Encrypt a plaintext secret. No-op if disabled, empty, or already encrypted."""
+    if not _fernet or not isinstance(value, str) or not value or value.startswith(_ENC_PREFIX):
+        return value
+    return _ENC_PREFIX + _fernet.encrypt(value.encode()).decode()
+
+
+def _dec(value):
+    """Decrypt an encrypted secret. Plaintext (no prefix) passes through — this is
+    what makes the migration from old plaintext data.json seamless."""
+    if not isinstance(value, str) or not value.startswith(_ENC_PREFIX):
+        return value
+    if not _fernet:
+        logger.error("Encrypted secret found but SECRET_KEY is not set; cannot decrypt.")
+        return value
+    try:
+        return _fernet.decrypt(value[len(_ENC_PREFIX):].encode()).decode()
+    except InvalidToken:
+        logger.error("Failed to decrypt a secret (wrong SECRET_KEY?). Leaving value as-is.")
+        return value
+
+
+def _apply_to_secret_fields(data, fn):
+    """Apply fn to each known secret field of a data dict, in place. Operate only
+    on a dict you own (a fresh load or a deep copy) — never on a shared one."""
+    for srv in data.get('servers', []) or []:
+        if isinstance(srv, dict):
+            for k in ('password', 'private_key'):
+                if srv.get(k):
+                    srv[k] = fn(srv[k])
+    settings = data.get('settings', {})
+    if isinstance(settings, dict):
+        tg = settings.get('telegram')
+        if isinstance(tg, dict) and tg.get('token'):
+            tg['token'] = fn(tg['token'])
+        sync = settings.get('sync')
+        if isinstance(sync, dict) and sync.get('remnawave_api_key'):
+            sync['remnawave_api_key'] = fn(sync['remnawave_api_key'])
+        ssl = settings.get('ssl')
+        if isinstance(ssl, dict) and ssl.get('key_text'):
+            ssl['key_text'] = fn(ssl['key_text'])
+    return data
 
 
 # ======================== Translations ========================
@@ -146,6 +213,8 @@ def load_data():
     # Notification preferences (auto-broadcasts to bot users). Added lazily so
     # existing installs pick up the default without losing other settings.
     data['settings'].setdefault('notifications', {'server_events': True})
+    # Transparently decrypt secrets so callers always see plaintext.
+    _apply_to_secret_fields(data, _dec)
     return data
 
 
@@ -160,8 +229,28 @@ def _notify_bot(coro_factory):
 
 
 def save_data(data):
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    # Encrypt on a deep copy so the caller's in-memory dict stays plaintext.
+    payload = _apply_to_secret_fields(copy.deepcopy(data), _enc)
+    serialized = json.dumps(payload, indent=2, ensure_ascii=False)
+    target_dir = os.path.dirname(DATA_FILE) or '.'
+    with _FILE_LOCK:
+        # Atomic write: temp file in the same directory + os.replace. Requires
+        # DATA_FILE to live in a normal directory (k8s mounts the PVC as a dir,
+        # not a single-file subPath), otherwise the rename across the bind mount
+        # fails.
+        fd, tmp = tempfile.mkstemp(dir=target_dir, prefix='.data.', suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(serialized)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, DATA_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 async def save_data_async(data):
