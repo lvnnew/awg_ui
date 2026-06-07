@@ -30,6 +30,9 @@ coverage.xml
 
 # User data
 data.json
+# Local data backups / dumps (may contain plaintext secrets) — never commit
+_backup_*.json
+data.json.bak*
 .DS_Store
 
 # IDEs
