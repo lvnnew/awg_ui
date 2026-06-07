@@ -333,10 +333,7 @@ def _build_connections_keyboard(conns: list, data: dict) -> dict:
         proto = _proto_label(c.get("protocol", ""))
         name = c.get("name", "Connection")
         label = f"🔐 {name} · {proto} · {server_name}"
-        rows.append([
-            {"text": label, "callback_data": f"cfg:{c['id']}"},
-            {"text": "🗑", "callback_data": f"del:{c['id']}"},
-        ])
+        rows.append([{"text": label, "callback_data": f"cfg:{c['id']}"}])
     rows.append([{"text": "🔄 Обновить", "callback_data": "mine"}])
     rows.append([{"text": "⬅️ Меню", "callback_data": "menu"}])
     return {"inline_keyboard": rows}
@@ -666,6 +663,15 @@ async def _handle_get_existing_config(api: TelegramAPI, chat_id: int, callback_i
     if loading_id:
         await api.call("deleteMessage", chat_id=chat_id, message_id=loading_id)
     await _send_config(api, chat_id, name, server, proto, config)
+    # Per-config management card: delete lives here (keeps the list single-column).
+    await api.send_message(
+        chat_id,
+        f"⚙️ Управление конфигом «<b>{html.escape(name)}</b>»:",
+        reply_markup={"inline_keyboard": [
+            [{"text": "🗑 Удалить это подключение", "callback_data": f"del:{conn_id}"}],
+            [{"text": "⬅️ К списку", "callback_data": "mine"}],
+        ]},
+    )
 
 
 async def _confirm_delete(api: TelegramAPI, chat_id: int, callback_id: str, message_id: Optional[int], conn_id: str, tg_id: str, services: dict):
