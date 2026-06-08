@@ -1052,7 +1052,9 @@ def tpl(request, template, **kwargs):
         'all_translations_json': json.dumps(TRANSLATIONS)
     }
     ctx.update(kwargs)
-    return templates.TemplateResponse(template, ctx)
+    response = templates.TemplateResponse(template, ctx)
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 # ======================== Pydantic Models ========================

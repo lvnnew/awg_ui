@@ -442,11 +442,11 @@
                             <div class="client-meta">
                                 <span style="cursor:pointer; color:var(--primary); text-decoration: underline;" onclick="viewUserConnections('${u.id}', '${u.username.replace(/'/g, "\\'")}')">🔗 ${u.connections_count} ${_('connections')}</span>
                                 ${u.created_at ? `<span>📅 ${u.created_at.substring(0, 10)}</span>` : ''}
-                                ${u.invite_code ? `<span>🎟️ ${_('user_invite_code')}: ${u.invite_code}</span>` : ''}
+                                <span>🎟️ ${_('user_invite_code')}: ${u.invite_code || '—'}</span>
                                 ${u.telegramId ? `<span>💬 ${u.telegramId}</span>` : ''}
                                 ${u.email ? `<span>📧 ${u.email}</span>` : ''}
-                                ${u.last_login_at ? `<span>🌐 ${_('user_last_login')}: ${formatUserDate(u.last_login_at)}</span>` : ''}
-                                ${u.last_bot_at ? `<span>🤖 ${_('user_last_bot')}: ${formatUserDate(u.last_bot_at)}</span>` : ''}
+                                <span>🌐 ${_('user_last_login')}: ${u.last_login_at ? formatUserDate(u.last_login_at) : '—'}</span>
+                                <span>🤖 ${_('user_last_bot')}: ${u.last_bot_at ? formatUserDate(u.last_bot_at) : '—'}</span>
                                 ${u.expiration_date ? `<span style="color: ${new Date(u.expiration_date) < new Date() ? 'var(--danger)' : 'var(--text-muted)'}">⌛ ${_('expiration_date_label')}: ${new Date(u.expiration_date).toLocaleString()}</span>` : ''}
                             </div>
                             ${u.description ? `<div class="client-meta" style="font-size: 0.75rem; opacity: 0.8; margin-top: 2px;">📝 ${u.description}</div>` : ''}

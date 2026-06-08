@@ -21,6 +21,8 @@
 ### Changed
 - API `/api/users`, `/api/users/{id}/connections`, `/api/invite-codes` расширены
   соответствующими полями.
+- Поля активности и инвайтов **всегда видны** в UI (пустые — «—»), HTML-страницы
+  отдаются с `Cache-Control: no-store`.
 
 ## [2026-06-08] — Автобэкап в S3 (data.json + SECRET_KEY)
 
