@@ -442,8 +442,11 @@
                             <div class="client-meta">
                                 <span style="cursor:pointer; color:var(--primary); text-decoration: underline;" onclick="viewUserConnections('${u.id}', '${u.username.replace(/'/g, "\\'")}')">🔗 ${u.connections_count} ${_('connections')}</span>
                                 ${u.created_at ? `<span>📅 ${u.created_at.substring(0, 10)}</span>` : ''}
+                                ${u.invite_code ? `<span>🎟️ ${_('user_invite_code')}: ${u.invite_code}</span>` : ''}
                                 ${u.telegramId ? `<span>💬 ${u.telegramId}</span>` : ''}
                                 ${u.email ? `<span>📧 ${u.email}</span>` : ''}
+                                ${u.last_login_at ? `<span>🌐 ${_('user_last_login')}: ${formatUserDate(u.last_login_at)}</span>` : ''}
+                                ${u.last_bot_at ? `<span>🤖 ${_('user_last_bot')}: ${formatUserDate(u.last_bot_at)}</span>` : ''}
                                 ${u.expiration_date ? `<span style="color: ${new Date(u.expiration_date) < new Date() ? 'var(--danger)' : 'var(--text-muted)'}">⌛ ${_('expiration_date_label')}: ${new Date(u.expiration_date).toLocaleString()}</span>` : ''}
                             </div>
                             ${u.description ? `<div class="client-meta" style="font-size: 0.75rem; opacity: 0.8; margin-top: 2px;">📝 ${u.description}</div>` : ''}
@@ -479,7 +482,7 @@
                     }
                     return '';
                 })()}
-                             ${u.traffic_reset_strategy !== 'never' ? `<div class="client-meta" style="font-size: 0.7rem; opacity: 0.6;">🔄 ${_('traffic_reset_strategy_label')}: ${_('traffic_reset_' + u.traffic_reset_strategy)}</div>` : ''}
+                             ${u.traffic_reset_strategy !== 'never' ? `<div class="client-meta" style="font-size: 0.7rem; opacity: 0.6;">🔄 ${_('traffic_reset_strategy_label')}: ${_('traffic_reset_' + u.traffic_reset_strategy)}${u.last_reset_at ? ` · ${_('user_last_reset')}: ${formatUserDate(u.last_reset_at)}` : ''}</div>` : ''}
                         </div>
                     </div>
                     <div class="client-actions" style="flex-wrap: wrap; justify-content: flex-end; max-width: 140px;">
@@ -777,6 +780,22 @@
         }
     }
 
+    function formatUserDate(iso) {
+        if (!iso) return '';
+        try {
+            return new Date(iso).toLocaleString();
+        } catch (e) {
+            return iso.substring(0, 16).replace('T', ' ');
+        }
+    }
+
+    function formatConnBytes(bytes) {
+        if (!bytes || bytes <= 0) return '';
+        const gb = bytes / Math.pow(1024, 3);
+        if (gb >= 1) return gb.toFixed(2) + ' ГБ';
+        return (bytes / Math.pow(1024, 2)).toFixed(1) + ' МБ';
+    }
+
     async function viewUserConnections(userId, username) {
         document.getElementById('userConnsTitle').textContent = `${_('connections')} — ${username}`;
         const listEl = document.getElementById('userConnsList');
@@ -790,16 +809,23 @@
             }
             listEl.innerHTML = '';
             data.connections.forEach(c => {
+                const protoLabel = c.protocol === 'awg' ? 'AmneziaWG' : (c.protocol === 'awg2' ? 'AmneziaWG 2.0' : (c.protocol === 'awg_legacy' ? 'AWG Legacy' : (c.protocol === 'xray' ? 'Xray' : c.protocol.toUpperCase())));
+                let meta = `<span>🖥 ${c.server_name || ''}</span><span>${protoLabel}</span>`;
+                if (c.created_at) meta += `<span>📅 ${_('conn_created')}: ${formatUserDate(c.created_at)}</span>`;
+                if (c.live_enabled === false) meta += `<span class="badge badge-danger" style="font-size:0.65rem;">${_('conn_status_offline')}</span>`;
+                else if (c.live_enabled === true) meta += `<span class="badge badge-success" style="font-size:0.65rem;">${_('conn_status_online')}</span>`;
+                if (c.handshake) meta += `<span>🤝 ${c.handshake}</span>`;
+                const rx = c.traffic_rx || c.traffic_total;
+                const tx = c.traffic_tx;
+                if (rx) meta += `<span>↓ ${formatConnBytes(rx)}</span>`;
+                if (tx) meta += `<span>↑ ${formatConnBytes(tx)}</span>`;
                 listEl.innerHTML += `
                     <div class="client-item">
                         <div class="client-info">
                             <div class="client-avatar">🔗</div>
                             <div>
                                 <div class="client-name">${c.name || 'Connection'}</div>
-                                <div class="client-meta">
-                                    <span>🖥 ${c.server_name || ''}</span>
-                                    <span>${c.protocol === 'awg' ? 'AmneziaWG' : (c.protocol === 'awg2' ? 'AmneziaWG 2.0' : (c.protocol === 'awg_legacy' ? 'AWG Legacy' : (c.protocol === 'xray' ? 'Xray' : c.protocol.toUpperCase())))}</span>
-                                </div>
+                                <div class="client-meta">${meta}</div>
                             </div>
                         </div>
                         <div class="client-actions">

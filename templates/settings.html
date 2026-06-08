@@ -1019,10 +1019,15 @@
             list.innerHTML = codes.map(c => {
                 const uses = (c.max_uses === 0) ? (c.uses + ' / ∞') : (c.uses + ' / ' + c.max_uses);
                 const note = c.note ? (' · ' + c.note.replace(/</g, '&lt;')) : '';
+                const createdBy = c.created_by ? `<div class="form-hint" style="margin-top:2px;">${_('invite_created_by')}: ${c.created_by.replace(/</g, '&lt;')}</div>` : '';
+                const usedBy = (c.used_by && c.used_by.length)
+                    ? `<div class="form-hint" style="margin-top:4px;">${_('invite_used_by')}: ${c.used_by.map(u => `${u.telegram_id} (${(u.at || '').substring(0, 10)})`).join(', ')}</div>`
+                    : '';
                 return `<div style="display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 0; border-bottom:1px solid var(--border-color);">
-                    <div>
+                    <div style="flex:1; min-width:0;">
                         <code style="font-size:1rem; font-weight:600;">${c.code}</code>
                         <span class="form-hint" style="margin-left:8px;">${inviteStateLabel(c)} · использований: ${uses}${note}</span>
+                        ${createdBy}${usedBy}
                     </div>
                     <div style="display:flex; gap:6px;">
                         <button class="btn btn-secondary btn-sm" onclick="copyInvite('${c.code}')">📋</button>

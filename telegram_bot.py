@@ -128,12 +128,19 @@ class TelegramAPI:
 # ----------------------------------------------------------------------- #
 #  Helpers
 # ----------------------------------------------------------------------- #
-def _find_user(load_data_fn: Callable, tg_id: str):
+def _find_user(load_data_fn: Callable, tg_id: str, services: dict = None):
     data = load_data_fn()
     tg_id_clean = str(tg_id).lstrip("@")
     for u in data.get("users", []):
         stored = str(u.get("telegramId", "") or "").lstrip("@")
         if stored and stored == tg_id_clean:
+            if services:
+                fn = services.get("record_bot_activity")
+                if fn:
+                    try:
+                        fn(tg_id_clean)
+                    except Exception:
+                        pass
             return u
     return None
 
@@ -433,6 +440,12 @@ async def _try_register(api: TelegramAPI, chat_id: int, tg_id: str, first_name: 
         await api.send_message(chat_id, _REG_ERRORS.get(res["error"], f"❌ Ошибка: {res['error']}"))
         return
     _pending.pop(tg_id, None)
+    fn = services.get("record_bot_activity")
+    if fn:
+        try:
+            await asyncio.to_thread(fn, tg_id)
+        except Exception:
+            pass
     await api.send_message(
         chat_id,
         f"🎉 Регистрация прошла успешно!\n"
@@ -457,7 +470,7 @@ async def _handle_start(api: TelegramAPI, msg: dict, services: dict):
     if len(parts) > 1:
         payload = parts[1].strip()
 
-    panel_user = _find_user(services["load_data"], tg_id)
+    panel_user = _find_user(services["load_data"], tg_id, services)
 
     if not panel_user:
         if payload:
@@ -476,7 +489,7 @@ async def _handle_start(api: TelegramAPI, msg: dict, services: dict):
 
 
 async def _show_menu(api: TelegramAPI, chat_id: int, message_id: Optional[int], tg_id: str, services: dict):
-    panel_user = _find_user(services["load_data"], tg_id)
+    panel_user = _find_user(services["load_data"], tg_id, services)
     if not panel_user:
         await _show_welcome_for_new(api, chat_id, tg_id, "")
         return
@@ -488,7 +501,7 @@ async def _show_menu(api: TelegramAPI, chat_id: int, message_id: Optional[int], 
 
 
 async def _show_help(api: TelegramAPI, chat_id: int, message_id: Optional[int], tg_id: str, services: dict):
-    panel_user = _find_user(services["load_data"], tg_id)
+    panel_user = _find_user(services["load_data"], tg_id, services)
     if not panel_user:
         await _show_welcome_for_new(api, chat_id, tg_id, "")
         return
@@ -563,7 +576,7 @@ async def _ask_device_name(api: TelegramAPI, chat_id: int, message_id: int, tg_i
 
 
 async def _create_and_send(api: TelegramAPI, chat_id: int, tg_id: str, server_id: int, proto: str, name: str, services: dict):
-    panel_user = _find_user(services["load_data"], tg_id)
+    panel_user = _find_user(services["load_data"], tg_id, services)
     if not panel_user:
         await api.send_message(chat_id, "❌ Доступ запрещён. Зарегистрируйся: /start")
         return
@@ -605,7 +618,7 @@ async def _create_and_send(api: TelegramAPI, chat_id: int, tg_id: str, server_id
 #  Existing connections
 # ----------------------------------------------------------------------- #
 async def _show_my_connections(api: TelegramAPI, chat_id: int, message_id: Optional[int], tg_id: str, services: dict):
-    panel_user = _find_user(services["load_data"], tg_id)
+    panel_user = _find_user(services["load_data"], tg_id, services)
     if not panel_user:
         await _show_welcome_for_new(api, chat_id, tg_id, "")
         return
@@ -625,7 +638,7 @@ async def _show_my_connections(api: TelegramAPI, chat_id: int, message_id: Optio
 
 async def _handle_get_existing_config(api: TelegramAPI, chat_id: int, callback_id: str, conn_id: str, tg_id: str, services: dict):
     await api.answer_callback(callback_id, "Получаю конфиг…")
-    panel_user = _find_user(services["load_data"], tg_id)
+    panel_user = _find_user(services["load_data"], tg_id, services)
     if not panel_user:
         await api.send_message(chat_id, "❌ Доступ запрещён.")
         return
@@ -677,7 +690,7 @@ async def _handle_get_existing_config(api: TelegramAPI, chat_id: int, callback_i
 async def _confirm_delete(api: TelegramAPI, chat_id: int, callback_id: str, message_id: Optional[int], conn_id: str, tg_id: str, services: dict):
     """Step 1: ask the user to confirm deleting one of their own connections."""
     await api.answer_callback(callback_id)
-    panel_user = _find_user(services["load_data"], tg_id)
+    panel_user = _find_user(services["load_data"], tg_id, services)
     if not panel_user:
         await api.send_message(chat_id, "❌ Доступ запрещён.")
         return
@@ -708,7 +721,7 @@ async def _confirm_delete(api: TelegramAPI, chat_id: int, callback_id: str, mess
 async def _do_delete(api: TelegramAPI, chat_id: int, callback_id: str, message_id: Optional[int], conn_id: str, tg_id: str, services: dict):
     """Step 2: actually remove the peer on the server and drop the record."""
     await api.answer_callback(callback_id, "Удаляю…")
-    panel_user = _find_user(services["load_data"], tg_id)
+    panel_user = _find_user(services["load_data"], tg_id, services)
     if not panel_user:
         await api.send_message(chat_id, "❌ Доступ запрещён.")
         return
@@ -735,7 +748,7 @@ async def _do_delete(api: TelegramAPI, chat_id: int, callback_id: str, message_i
 #  Server status
 # ----------------------------------------------------------------------- #
 async def _show_status(api: TelegramAPI, chat_id: int, message_id: Optional[int], tg_id: str, services: dict):
-    panel_user = _find_user(services["load_data"], tg_id)
+    panel_user = _find_user(services["load_data"], tg_id, services)
     if not panel_user:
         await _show_welcome_for_new(api, chat_id, tg_id, "")
         return
@@ -844,7 +857,7 @@ async def _send_config(api: TelegramAPI, chat_id: int, name: str, server: dict, 
 async def _handle_newcode(api: TelegramAPI, msg: dict, services: dict):
     chat_id = msg["chat"]["id"]
     tg_id = str(msg["from"]["id"])
-    panel_user = _find_user(services["load_data"], tg_id)
+    panel_user = _find_user(services["load_data"], tg_id, services)
     if not panel_user or panel_user.get("role") != "admin":
         await api.send_message(chat_id, "❌ Команда доступна только администратору.")
         return
@@ -867,7 +880,7 @@ async def _handle_newcode(api: TelegramAPI, msg: dict, services: dict):
 async def _handle_broadcast(api: TelegramAPI, msg: dict, services: dict):
     chat_id = msg["chat"]["id"]
     tg_id = str(msg["from"]["id"])
-    panel_user = _find_user(services["load_data"], tg_id)
+    panel_user = _find_user(services["load_data"], tg_id, services)
     if not panel_user or panel_user.get("role") != "admin":
         await api.send_message(chat_id, "❌ Команда доступна только администратору.")
         return
@@ -1019,7 +1032,7 @@ async def _dispatch(api: TelegramAPI, update: dict, services: dict):
             return
 
         # Unknown text — route by registration status
-        if _find_user(services["load_data"], tg_id):
+        if _find_user(services["load_data"], tg_id, services):
             await _show_menu(api, chat_id, None, tg_id, services)
         else:
             await _show_welcome_for_new(api, chat_id, tg_id, first_name)

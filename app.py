@@ -509,6 +509,67 @@ def delete_user_connection(user_id: str, conn_id: str) -> dict:
     return {'status': 'success', 'name': conn.get('name', '')}
 
 
+def record_bot_activity(telegram_id: str):
+    """Update last_bot_at for a user matched by Telegram ID."""
+    tg = str(telegram_id or '').lstrip('@')
+    if not tg:
+        return
+    data = load_data()
+    for u in data.get('users', []):
+        if str(u.get('telegramId', '') or '').lstrip('@') == tg:
+            u['last_bot_at'] = datetime.now().isoformat()
+            save_data(data)
+            return
+
+
+def enrich_connections_live_stats(conns: list, data: dict) -> list:
+    """Attach live peer stats from servers (one SSH session per server)."""
+    if not conns:
+        return conns
+    by_server: dict = {}
+    for c in conns:
+        by_server.setdefault(c.get('server_id', 0), []).append(c)
+    for sid, group in by_server.items():
+        servers = data.get('servers', [])
+        if sid < 0 or sid >= len(servers):
+            continue
+        server = servers[sid]
+        try:
+            ssh = get_ssh(server)
+            ssh.connect()
+            protocols = {c.get('protocol') for c in group}
+            live_map = {}
+            for proto in protocols:
+                if proto not in (server.get('protocols') or {}):
+                    continue
+                manager = get_protocol_manager(ssh, proto)
+                for client in _manager_call(manager, 'get_clients', proto):
+                    cid = client.get('clientId', '')
+                    live_map[(proto, cid)] = client
+            ssh.disconnect()
+            for c in group:
+                live = live_map.get((c.get('protocol'), c.get('client_id')))
+                if not live:
+                    continue
+                ud = live.get('userData') or {}
+                enabled = live.get('enabled')
+                if enabled is None:
+                    enabled = ud.get('enabled', True)
+                c['live_enabled'] = bool(enabled)
+                c['handshake'] = ud.get('latestHandshake') or ''
+                rx = ud.get('dataReceivedBytes') or ud.get('dataReceived')
+                tx = ud.get('dataSentBytes') or ud.get('dataSent')
+                if isinstance(rx, (int, float)):
+                    c['traffic_rx'] = rx
+                if isinstance(tx, (int, float)):
+                    c['traffic_tx'] = tx
+                if ud.get('total_octets') is not None:
+                    c['traffic_total'] = ud.get('total_octets')
+        except Exception as e:
+            logger.warning('Live stats for server %s failed: %s', sid, e)
+    return conns
+
+
 def bot_services() -> dict:
     """Capabilities injected into the Telegram bot so it can self-register users
     and provision connections without importing app internals (avoids cycles)."""
@@ -521,6 +582,7 @@ def bot_services() -> dict:
         'get_client_config': get_client_config_for_connection,
         'create_invite_codes': create_invite_codes_for_bot,
         'get_servers_status': get_servers_status,
+        'record_bot_activity': record_bot_activity,
     }
 
 
@@ -1657,6 +1719,8 @@ async def api_login(request: Request, req: LoginRequest):
             if not u.get('enabled', True):
                 return JSONResponse({'error': _t('account_disabled', lang)}, status_code=403)
             request.session['user_id'] = u['id']
+            u['last_login_at'] = datetime.now().isoformat()
+            save_data(data)
             return {'status': 'success', 'role': u['role']}
     lang = request.cookies.get('lang', 'ru')
     return JSONResponse({'error': _t('invalid_login', lang)}, status_code=401)
@@ -2618,12 +2682,15 @@ async def api_list_users(request: Request, search: str = '', page: int = 1, size
             'traffic_total': u.get('traffic_total', 0),
             'traffic_limit': u.get('traffic_limit', 0),
             'traffic_reset_strategy': u.get('traffic_reset_strategy', 'never'),
-            'last_reset_at': u.get('last_reset_at'),
             "expiration_date": u.get("expiration_date"),
             'share_enabled': u.get('share_enabled', False),
             'share_token': u.get('share_token'),
             'has_share_password': bool(u.get('share_password_hash')),
-            'source': 'Remnawave' if u.get('remnawave_uuid') else 'Local'
+            'source': 'Remnawave' if u.get('remnawave_uuid') else 'Local',
+            'invite_code': u.get('invite_code'),
+            'last_login_at': u.get('last_login_at'),
+            'last_bot_at': u.get('last_bot_at'),
+            'last_reset_at': u.get('last_reset_at'),
         })
     return {
         'users': users,
@@ -2877,6 +2944,8 @@ async def api_get_user_connections(request: Request, user_id: str):
         sid = c.get('server_id', 0)
         if sid < len(data['servers']):
             c['server_name'] = data['servers'][sid].get('name', '')
+    if user['role'] in ('admin', 'support'):
+        conns = await asyncio.to_thread(enrich_connections_live_stats, conns, data)
     return {'connections': conns}
 
 
@@ -3265,6 +3334,7 @@ async def api_list_invite_codes(request: Request):
     codes = []
     for c in data.get('invite_codes', []):
         ok, reason = invite_code_valid(c)
+        used_by = c.get('used_by') or []
         codes.append({
             'code': c.get('code'),
             'note': c.get('note', ''),
@@ -3274,6 +3344,8 @@ async def api_list_invite_codes(request: Request):
             'enabled': c.get('enabled', True),
             'expires_at': c.get('expires_at'),
             'created_at': c.get('created_at'),
+            'created_by': c.get('created_by'),
+            'used_by': used_by,
             'valid': ok,
             'state': reason,
         })
