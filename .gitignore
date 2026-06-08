@@ -35,6 +35,9 @@ _backup_*.json
 data.json.bak*
 .DS_Store
 
+# Ad-hoc ops scripts (contain server credentials) — never commit
+_ops/
+
 # IDEs
 .vscode/
 .idea/

@@ -8,6 +8,7 @@ import hashlib
 import secrets
 import tempfile
 import threading
+import shutil
 import uuid
 import asyncio
 from datetime import datetime, timedelta
@@ -31,6 +32,13 @@ from managers.ssh_manager import SSHManager
 from managers.awg_manager import AWGManager
 from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
+from managers.s3_backup import (
+    default_backup_settings,
+    list_recent_backups,
+    run_backup as s3_run_backup,
+    test_connection as s3_test_connection,
+    validate_backup_config,
+)
 import telegram_bot as tg_bot
 
 # Configure logging
@@ -150,6 +158,11 @@ def _apply_to_secret_fields(data, fn):
         ssl = settings.get('ssl')
         if isinstance(ssl, dict) and ssl.get('key_text'):
             ssl['key_text'] = fn(ssl['key_text'])
+        backup = settings.get('backup')
+        if isinstance(backup, dict):
+            for k in ('access_key_id', 'secret_access_key'):
+                if backup.get(k):
+                    backup[k] = fn(backup[k])
     return data
 
 
@@ -213,6 +226,7 @@ def load_data():
     # Notification preferences (auto-broadcasts to bot users). Added lazily so
     # existing installs pick up the default without losing other settings.
     data['settings'].setdefault('notifications', {'server_events': True})
+    data['settings'].setdefault('backup', default_backup_settings())
     # Transparently decrypt secrets so callers always see plaintext.
     _apply_to_secret_fields(data, _dec)
     return data
@@ -1198,6 +1212,19 @@ class NotificationSettingsRequest(BaseModel):
     server_events: bool = True
 
 
+class BackupSettingsRequest(BaseModel):
+    enabled: bool = False
+    endpoint_url: str = ''
+    region: str = 'us-east-1'
+    bucket: str = ''
+    prefix: str = 'awg-panel/backups/'
+    access_key_id: str = ''
+    secret_access_key: str = ''
+    force_path_style: bool = True
+    interval_hours: int = 12
+    retention_count: int = 30
+
+
 class ShareSetupRequest(BaseModel):
     enabled: bool
     password: Optional[str] = None
@@ -1205,6 +1232,91 @@ class ShareSetupRequest(BaseModel):
 
 class ShareAuthRequest(BaseModel):
     password: str
+
+
+# ======================== S3 backup ========================
+
+_S3_BACKUP_LOCK = asyncio.Lock()
+
+
+def _merge_backup_settings(existing: dict, incoming: dict) -> dict:
+    merged = {**default_backup_settings(), **(existing or {}), **incoming}
+    if not (incoming.get('secret_access_key') or '').strip():
+        merged['secret_access_key'] = (existing or {}).get('secret_access_key', '')
+    if not (incoming.get('access_key_id') or '').strip():
+        merged['access_key_id'] = (existing or {}).get('access_key_id', '')
+    return merged
+
+
+def _backup_settings_due(cfg: dict) -> bool:
+    if not cfg.get('enabled'):
+        return False
+    last = cfg.get('last_run_at')
+    interval_h = max(1, int(cfg.get('interval_hours') or 12))
+    if not last:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last)
+    except Exception:
+        return True
+    return datetime.now() - last_dt >= timedelta(hours=interval_h)
+
+
+def _persist_backup_status(data: dict, *, status: str, error: str = '', backup_key: str = ''):
+    backup = data.setdefault('settings', {}).setdefault('backup', default_backup_settings())
+    backup['last_run_at'] = datetime.now().isoformat()
+    backup['last_status'] = status
+    backup['last_error'] = error or ''
+    if backup_key:
+        backup['last_backup_key'] = backup_key
+    save_data(data)
+
+
+async def run_scheduled_s3_backup(*, manual: bool = False) -> dict:
+    async with _S3_BACKUP_LOCK:
+        data = load_data()
+        cfg = data.get('settings', {}).get('backup', default_backup_settings())
+        if not manual:
+            if not cfg.get('enabled'):
+                return {'status': 'skipped', 'reason': 'disabled'}
+            if not _backup_settings_due(cfg):
+                return {'status': 'skipped', 'reason': 'not_due'}
+
+        err = validate_backup_config(cfg)
+        if err:
+            _persist_backup_status(data, status='error', error=err)
+            return {'status': 'error', 'error': err}
+
+        secret_key = os.environ.get('SECRET_KEY') or ''
+        try:
+            result = await asyncio.to_thread(
+                s3_run_backup,
+                data_path=DATA_FILE,
+                secret_key=secret_key,
+                cfg=cfg,
+                panel_version=CURRENT_VERSION,
+            )
+            _persist_backup_status(data, status='ok', backup_key=result['backup_key'])
+            logger.info(
+                'S3 backup OK: s3://%s/%s (pruned %s old folders)',
+                result['bucket'], result['backup_key'], result.get('pruned_folders', 0),
+            )
+            return {'status': 'success', **result}
+        except Exception as e:
+            logger.exception('S3 backup failed')
+            _persist_backup_status(data, status='error', error=str(e))
+            return {'status': 'error', 'error': str(e)}
+
+
+async def periodic_s3_backup():
+    """Check every 5 minutes whether an automatic S3 backup is due."""
+    await asyncio.sleep(120)
+    while True:
+        try:
+            await run_scheduled_s3_backup(manual=False)
+        except Exception as e:
+            logger.error('periodic_s3_backup loop error: %s', e)
+        await asyncio.sleep(300)
 
 
 # ======================== Startup ========================
@@ -1282,6 +1394,7 @@ async def startup():
 
     # Start periodic background tasks
     asyncio.create_task(periodic_background_tasks())
+    asyncio.create_task(periodic_s3_backup())
 
     # Start Telegram bot if enabled
     tg_cfg = data.get('settings', {}).get('telegram', {})
@@ -3260,6 +3373,69 @@ async def api_broadcast(request: Request, req: BroadcastRequest):
     return {'status': 'success', **result}
 
 
+@app.get('/api/settings/backup/s3', tags=["Settings"])
+async def api_get_backup_s3_settings(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    cfg = {**default_backup_settings(), **data.get('settings', {}).get('backup', {})}
+    public = {k: v for k, v in cfg.items() if k not in ('access_key_id', 'secret_access_key')}
+    public['access_key_id_set'] = bool(cfg.get('access_key_id'))
+    public['secret_access_key_set'] = bool(cfg.get('secret_access_key'))
+    public['due'] = _backup_settings_due(cfg)
+    try:
+        public['recent'] = await asyncio.to_thread(list_recent_backups, cfg, 8)
+    except Exception:
+        public['recent'] = []
+    return public
+
+
+@app.post('/api/settings/backup/s3/save', tags=["Settings"])
+async def api_save_backup_s3_settings(request: Request, payload: BackupSettingsRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    existing = data.get('settings', {}).get('backup', {})
+    status_fields = {
+        k: existing.get(k) for k in (
+            'last_run_at', 'last_status', 'last_error', 'last_backup_key',
+        ) if k in existing
+    }
+    merged = _merge_backup_settings(existing, payload.dict())
+    merged.update(status_fields)
+    data.setdefault('settings', {})['backup'] = merged
+    save_data(data)
+    return {'status': 'success'}
+
+
+@app.post('/api/settings/backup/s3/test', tags=["Settings"])
+async def api_test_backup_s3(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    existing = data.get('settings', {}).get('backup', {})
+    try:
+        body = await request.json()
+        payload = BackupSettingsRequest(**body)
+        cfg = _merge_backup_settings(existing, payload.dict())
+    except Exception:
+        cfg = existing
+    ok, msg = await asyncio.to_thread(s3_test_connection, cfg)
+    if ok:
+        return {'status': 'success', 'message': msg}
+    return JSONResponse({'status': 'error', 'error': msg}, status_code=400)
+
+
+@app.post('/api/settings/backup/s3/run', tags=["Settings"])
+async def api_run_backup_s3(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    result = await run_scheduled_s3_backup(manual=True)
+    if result.get('status') == 'error':
+        return JSONResponse(result, status_code=500)
+    return result
+
+
 @app.get('/api/settings/backup/download', tags=["Settings"])
 async def api_backup_download(request: Request):
     if not _check_admin(request):
@@ -3292,6 +3468,10 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
         # Ensure types are correct
         if not isinstance(backup_data['servers'], list) or not isinstance(backup_data['users'], list):
             return JSONResponse({'error': 'Invalid structure: servers and users must be lists'}, status_code=400)
+
+        # Pre-restore safety copy on the PVC (same failure domain, but protects from bad upload)
+        if os.path.exists(DATA_FILE):
+            shutil.copy2(DATA_FILE, f"{DATA_FILE}.pre-restore.{int(datetime.now().timestamp())}")
 
         # Save the new data
         async with DATA_LOCK:

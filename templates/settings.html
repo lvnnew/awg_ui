@@ -326,6 +326,98 @@
             </p>
         </div>
 
+        <!-- BLOCK: S3 auto-backup -->
+        {% set backup = settings.backup if settings.backup is defined else {} %}
+        <div class="card" style="margin-top: var(--space-lg);">
+            <h3 class="card-title" style="margin-bottom: var(--space-lg);">☁️ {{ _('s3_backup_title') }}</h3>
+            <p class="form-hint" style="margin-bottom: var(--space-md);">
+                {{ _('s3_backup_hint') }}
+            </p>
+            <form id="s3BackupForm">
+                <div class="form-group">
+                    <label class="form-label">
+                        <input type="checkbox" id="s3_enabled" {% if backup.enabled %}checked{% endif %}>
+                        {{ _('s3_backup_enabled') }}
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">{{ _('s3_endpoint_url') }}</label>
+                    <input type="text" class="form-input" id="s3_endpoint_url"
+                        value="{{ backup.endpoint_url or '' }}"
+                        placeholder="https://s3.amazonaws.com">
+                    <p class="form-hint">{{ _('s3_endpoint_hint') }}</p>
+                </div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:var(--space-md);">
+                    <div class="form-group">
+                        <label class="form-label">{{ _('s3_region') }}</label>
+                        <input type="text" class="form-input" id="s3_region" value="{{ backup.region or 'us-east-1' }}">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">{{ _('s3_bucket') }}</label>
+                        <input type="text" class="form-input" id="s3_bucket" value="{{ backup.bucket or '' }}" required>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">{{ _('s3_prefix') }}</label>
+                    <input type="text" class="form-input" id="s3_prefix"
+                        value="{{ backup.prefix or 'awg-panel/backups/' }}">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">{{ _('s3_access_key_id') }}</label>
+                    <input type="text" class="form-input" id="s3_access_key_id"
+                        value="{{ backup.access_key_id or '' }}"
+                        placeholder="{% if backup.access_key_id %}••••••••{% endif %}">
+                    <p class="form-hint">{{ _('s3_secret_keep_hint') }}</p>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">{{ _('s3_secret_access_key') }}</label>
+                    <input type="password" class="form-input" id="s3_secret_access_key" autocomplete="new-password"
+                        placeholder="{% if backup.secret_access_key %}{{ _('s3_secret_saved') }}{% endif %}">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">
+                        <input type="checkbox" id="s3_force_path_style" {% if backup.force_path_style is not defined or backup.force_path_style %}checked{% endif %}>
+                        {{ _('s3_force_path_style') }}
+                    </label>
+                </div>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:var(--space-md);">
+                    <div class="form-group">
+                        <label class="form-label">{{ _('s3_interval_hours') }}</label>
+                        <input type="number" class="form-input" id="s3_interval_hours" min="1" max="168"
+                            value="{{ backup.interval_hours or 12 }}">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">{{ _('s3_retention_count') }}</label>
+                        <input type="number" class="form-input" id="s3_retention_count" min="1" max="365"
+                            value="{{ backup.retention_count or 30 }}">
+                    </div>
+                </div>
+            </form>
+            <div class="form-hint" style="margin: var(--space-md) 0; padding: var(--space-sm); border:1px solid var(--border-color); border-radius:8px;">
+                <div><strong>{{ _('s3_last_run') }}:</strong>
+                    <span id="s3LastRun">{{ backup.last_run_at or _('s3_never') }}</span></div>
+                <div><strong>{{ _('s3_last_status') }}:</strong>
+                    <span id="s3LastStatus">{{ backup.last_status or 'never' }}</span></div>
+                {% if backup.last_error %}
+                <div style="color:var(--danger); margin-top:4px;"><strong>{{ _('error') }}:</strong> {{ backup.last_error }}</div>
+                {% endif %}
+                {% if backup.last_backup_key %}
+                <div style="margin-top:4px;"><strong>{{ _('s3_last_key') }}:</strong> <code>{{ backup.last_backup_key }}</code></div>
+                {% endif %}
+            </div>
+            <div style="display:flex; flex-wrap:wrap; gap:var(--space-sm);">
+                <button type="button" class="btn btn-primary" onclick="saveBackupS3()" id="s3SaveBtn">
+                    <span>💾</span> {{ _('s3_save') }}
+                </button>
+                <button type="button" class="btn btn-secondary" onclick="testBackupS3()" id="s3TestBtn">
+                    <span>🔌</span> {{ _('s3_test') }}
+                </button>
+                <button type="button" class="btn btn-secondary" onclick="runBackupS3Now()" id="s3RunBtn">
+                    <span>⬆️</span> {{ _('s3_run_now') }}
+                </button>
+            </div>
+        </div>
+
         <!-- BLOCK: API Tokens -->
         <div class="card" style="margin-top: var(--space-lg);">
             <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom: var(--space-md);">
@@ -645,6 +737,81 @@
         } finally {
             btn.disabled = false;
             spinner.classList.add('hidden');
+        }
+    }
+
+    function collectBackupS3Payload() {
+        return {
+            enabled: document.getElementById('s3_enabled').checked,
+            endpoint_url: document.getElementById('s3_endpoint_url').value.trim(),
+            region: document.getElementById('s3_region').value.trim() || 'us-east-1',
+            bucket: document.getElementById('s3_bucket').value.trim(),
+            prefix: document.getElementById('s3_prefix').value.trim() || 'awg-panel/backups/',
+            access_key_id: document.getElementById('s3_access_key_id').value.trim(),
+            secret_access_key: document.getElementById('s3_secret_access_key').value,
+            force_path_style: document.getElementById('s3_force_path_style').checked,
+            interval_hours: parseInt(document.getElementById('s3_interval_hours').value, 10) || 12,
+            retention_count: parseInt(document.getElementById('s3_retention_count').value, 10) || 30,
+        };
+    }
+
+    async function saveBackupS3() {
+        const btn = document.getElementById('s3SaveBtn');
+        btn.disabled = true;
+        try {
+            const res = await fetch('/api/settings/backup/s3/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(collectBackupS3Payload()),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || _('error'));
+            showToast(_('s3_saved'), 'success');
+            setTimeout(() => window.location.reload(), 800);
+        } catch (err) {
+            showToast(err.message, 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async function testBackupS3() {
+        const btn = document.getElementById('s3TestBtn');
+        btn.disabled = true;
+        try {
+            const res = await fetch('/api/settings/backup/s3/test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(collectBackupS3Payload()),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || _('s3_test_failed'));
+            showToast(data.message || _('s3_test_ok'), 'success');
+        } catch (err) {
+            showToast(err.message, 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async function runBackupS3Now() {
+        const btn = document.getElementById('s3RunBtn');
+        btn.disabled = true;
+        try {
+            await fetch('/api/settings/backup/s3/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(collectBackupS3Payload()),
+            });
+            const res = await fetch('/api/settings/backup/s3/run', { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || _('s3_run_failed'));
+            showToast(_('s3_run_ok'), 'success');
+            setTimeout(() => window.location.reload(), 1200);
+        } catch (err) {
+            showToast(err.message, 'error');
+        } finally {
+            btn.disabled = false;
         }
     }
 
