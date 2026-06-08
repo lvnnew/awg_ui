@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+
+{% block title_extra %} — {{ profile.username }}{% endblock %}
+
+{% block content %}
+<section>
+    <div class="flex items-center justify-between" style="margin-bottom: var(--space-lg); gap: var(--space-md); flex-wrap: wrap;">
+        <h1 class="section-title" style="margin-bottom:0;">
+            <span class="icon">👤</span>
+            {{ profile.username }}
+            <span class="badge badge-{{ 'success' if profile.role == 'admin' else ('info' if profile.role == 'support' else 'warn') }}"
+                style="font-size:0.65rem; margin-left: var(--space-xs);">{{ profile.role | upper }}</span>
+            {% if not profile.enabled %}
+            <span class="badge badge-danger" style="font-size:0.65rem;">{{ _('disabled') }}</span>
+            {% endif %}
+        </h1>
+        <a href="/users" class="btn btn-secondary btn-sm">← {{ _('nav_users') }}</a>
+    </div>
+
+    <div class="card" style="margin-bottom: var(--space-lg);">
+        <h3 class="card-title" style="margin-bottom: var(--space-md);">{{ _('user_detail_profile') }}</h3>
+        <div class="client-meta" style="display:flex; flex-direction:column; gap:8px; font-size:0.9rem;">
+            <span>🎟️ {{ _('user_invite_code') }}: {{ profile.invite_code or '—' }}</span>
+            <span>💬 Telegram: {{ profile.telegramId or '—' }}</span>
+            <span>📧 Email: {{ profile.email or '—' }}</span>
+            <span>🌐 {{ _('user_last_login') }}: {{ profile.last_login_at and profile.last_login_at[:16].replace('T', ' ') or '—' }}</span>
+            <span>🤖 {{ _('user_last_bot') }}: {{ profile.last_bot_at and profile.last_bot_at[:16].replace('T', ' ') or '—' }}</span>
+            <span>📅 {{ _('conn_created') }}: {{ profile.created_at and profile.created_at[:10] or '—' }}</span>
+            <span>🔗 {{ _('connections') }}: {{ profile.connections_count }}</span>
+            {% if profile.description %}
+            <span>📝 {{ profile.description }}</span>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="card">
+        <h3 class="card-title" style="margin-bottom: var(--space-md);">{{ _('connections') }}</h3>
+        <div id="detailConnsLoading" style="text-align:center; padding:2rem;">
+            <div class="spinner" style="width:32px; height:32px; margin:0 auto;"></div>
+        </div>
+        <div id="detailConnsList" class="clients-list hidden"></div>
+        <div id="detailConnsEmpty" class="form-hint hidden">{{ _('no_connections') }}</div>
+    </div>
+</section>
+
+<script>
+    const profileId = {{ profile.id | tojson }};
+
+    function formatUserDate(iso) {
+        if (!iso) return '—';
+        try { return new Date(iso).toLocaleString(); } catch (e) { return iso.substring(0, 16).replace('T', ' '); }
+    }
+
+    function formatConnBytes(bytes) {
+        if (!bytes || bytes <= 0) return '';
+        const gb = bytes / Math.pow(1024, 3);
+        if (gb >= 1) return gb.toFixed(2) + ' ГБ';
+        return (bytes / Math.pow(1024, 2)).toFixed(1) + ' МБ';
+    }
+
+    document.addEventListener('DOMContentLoaded', async () => {
+        const loading = document.getElementById('detailConnsLoading');
+        const list = document.getElementById('detailConnsList');
+        const empty = document.getElementById('detailConnsEmpty');
+        try {
+            const data = await apiCall(`/api/users/${profileId}/connections`);
+            loading.classList.add('hidden');
+            if (!data.connections.length) {
+                empty.classList.remove('hidden');
+                return;
+            }
+            list.innerHTML = data.connections.map(c => {
+                const protoLabel = c.protocol === 'awg' ? 'AmneziaWG' : (c.protocol === 'awg2' ? 'AmneziaWG 2.0' : (c.protocol === 'awg_legacy' ? 'AWG Legacy' : (c.protocol === 'xray' ? 'Xray' : c.protocol.toUpperCase())));
+                let meta = `<span>🖥 ${c.server_name || ''}</span><span>${protoLabel}</span>`;
+                if (c.created_at) meta += `<span>📅 ${formatUserDate(c.created_at)}</span>`;
+                if (c.live_enabled === false) meta += `<span class="badge badge-danger" style="font-size:0.65rem;">${_('conn_status_offline')}</span>`;
+                else if (c.live_enabled === true) meta += `<span class="badge badge-success" style="font-size:0.65rem;">${_('conn_status_online')}</span>`;
+                if (c.handshake) meta += `<span>🤝 ${c.handshake}</span>`;
+                const rx = c.traffic_rx || c.traffic_total;
+                if (rx) meta += `<span>↓ ${formatConnBytes(rx)}</span>`;
+                if (c.traffic_tx) meta += `<span>↑ ${formatConnBytes(c.traffic_tx)}</span>`;
+                return `<div class="client-item"><div class="client-info"><div class="client-avatar">🔗</div><div><div class="client-name">${c.name || 'Connection'}</div><div class="client-meta">${meta}</div></div></div></div>`;
+            }).join('');
+            list.classList.remove('hidden');
+        } catch (err) {
+            loading.classList.add('hidden');
+            showToast(`${_('error')}: ${err.message}`, 'error');
+        }
+    });
+</script>
+{% endblock %}

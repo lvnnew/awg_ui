@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+
+{% block title_extra %} — {{ _('audit_title') }}{% endblock %}
+
+{% block content %}
+<section>
+    <div class="flex items-center justify-between" style="margin-bottom: var(--space-lg); gap: var(--space-md); flex-wrap: wrap;">
+        <h1 class="section-title" style="margin-bottom:0;">
+            <span class="icon">📋</span>
+            {{ _('audit_title') }}
+        </h1>
+        <a href="/users" class="btn btn-secondary btn-sm">← {{ _('nav_users') }}</a>
+    </div>
+
+    <div id="auditDisabledBanner" class="hidden" style="margin-bottom: var(--space-md); padding: var(--space-md); border-radius: var(--radius-md); background: var(--bg-primary); border: 1px solid var(--border-color); color: var(--text-muted);">
+        {{ _('audit_disabled_banner') }}
+    </div>
+
+    <div class="card" style="margin-bottom: var(--space-md); padding: var(--space-md);">
+        <div style="display:flex; gap: var(--space-sm); flex-wrap: wrap; align-items: center;">
+            <input type="text" class="form-input" id="auditSearch" placeholder="{{ _('search_placeholder') }}"
+                style="flex:1; min-width:200px;" oninput="debouncedAuditLoad()">
+            <select class="form-select" id="auditAction" style="width:auto; min-width:180px;" onchange="loadAudit()">
+                <option value="">{{ _('audit_filter_all_actions') }}</option>
+            </select>
+            <button class="btn btn-secondary btn-sm" onclick="resetAuditFilters()">{{ _('filter_reset') }}</button>
+        </div>
+    </div>
+
+    <div id="auditLoading" style="text-align:center; padding:3rem;">
+        <div class="spinner" style="width:40px; height:40px; margin:0 auto;"></div>
+    </div>
+    <div id="auditEmpty" class="empty-state hidden">
+        <div class="empty-icon">📋</div>
+        <div class="empty-title">{{ _('audit_empty') }}</div>
+    </div>
+    <div id="auditContainer" class="hidden">
+        <div class="clients-list" id="auditList"></div>
+        <div style="display:flex; justify-content:center; align-items:center; gap:var(--space-md); margin-top:var(--space-xl);">
+            <button class="btn btn-secondary btn-sm" id="auditPrev" onclick="changeAuditPage(-1)">{{ _('prev_page') }}</button>
+            <span id="auditPageInfo" style="font-weight:600; font-size:0.9rem;"></span>
+            <button class="btn btn-secondary btn-sm" id="auditNext" onclick="changeAuditPage(1)">{{ _('next_page') }}</button>
+        </div>
+    </div>
+</section>
+
+<script>
+    let auditPage = 1;
+    let auditTimeout = null;
+    const AUDIT_ACTIONS = [
+        'auth.login', 'user.create', 'user.update', 'user.delete', 'user.toggle',
+        'user.register', 'user.connection.add', 'server.create', 'server.update', 'server.delete',
+        'invite.create', 'invite.delete', 'settings.save', 'token.create', 'token.delete',
+        'backup.restore', 'backup.s3_run', 'audit.settings', 'audit.clear',
+    ];
+
+    function debouncedAuditLoad() {
+        clearTimeout(auditTimeout);
+        auditTimeout = setTimeout(() => { auditPage = 1; loadAudit(); }, 300);
+    }
+
+    function resetAuditFilters() {
+        document.getElementById('auditSearch').value = '';
+        document.getElementById('auditAction').value = '';
+        auditPage = 1;
+        loadAudit();
+    }
+
+    function changeAuditPage(delta) {
+        auditPage += delta;
+        loadAudit();
+    }
+
+    function formatAuditDetails(details) {
+        if (!details || !Object.keys(details).length) return '';
+        try {
+            return JSON.stringify(details);
+        } catch (e) {
+            return String(details);
+        }
+    }
+
+    function actionLabel(action) {
+        const key = 'audit_action_' + action.replace(/\./g, '_');
+        const t = _(key);
+        return t === key ? action : t;
+    }
+
+    async function loadAudit() {
+        const loading = document.getElementById('auditLoading');
+        const container = document.getElementById('auditContainer');
+        const empty = document.getElementById('auditEmpty');
+        const list = document.getElementById('auditList');
+        loading.classList.remove('hidden');
+        container.classList.add('hidden');
+        empty.classList.add('hidden');
+
+        const search = encodeURIComponent(document.getElementById('auditSearch').value || '');
+        const action = encodeURIComponent(document.getElementById('auditAction').value || '');
+        try {
+            const data = await apiCall(`/api/audit-log?search=${search}&action=${action}&page=${auditPage}&size=30`);
+            const banner = document.getElementById('auditDisabledBanner');
+            if (banner) banner.classList.toggle('hidden', data.enabled !== false);
+            if (!data.entries.length) {
+                loading.classList.add('hidden');
+                empty.classList.remove('hidden');
+                return;
+            }
+            list.innerHTML = data.entries.map(e => `
+                <div class="client-item">
+                    <div class="client-info">
+                        <div class="client-avatar">📝</div>
+                        <div style="min-width:0;">
+                            <div class="client-name">${actionLabel(e.action)}</div>
+                            <div class="client-meta">
+                                <span>👤 ${e.actor || '—'}</span>
+                                <span>🕐 ${new Date(e.at).toLocaleString()}</span>
+                                ${e.target_type ? `<span>${e.target_type}: ${e.target_id || '—'}</span>` : ''}
+                            </div>
+                            ${formatAuditDetails(e.details) ? `<div class="form-hint" style="margin-top:4px; word-break:break-all;">${formatAuditDetails(e.details).replace(/</g, '&lt;')}</div>` : ''}
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+            document.getElementById('auditPageInfo').textContent = _('page_info').replace('{}', data.page).replace('{}', data.pages || 1);
+            document.getElementById('auditPrev').disabled = data.page <= 1;
+            document.getElementById('auditNext').disabled = data.page >= data.pages;
+            loading.classList.add('hidden');
+            container.classList.remove('hidden');
+        } catch (err) {
+            loading.classList.add('hidden');
+            showToast(`${_('error')}: ${err.message}`, 'error');
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        const sel = document.getElementById('auditAction');
+        AUDIT_ACTIONS.forEach(a => {
+            const opt = document.createElement('option');
+            opt.value = a;
+            opt.textContent = actionLabel(a);
+            sel.appendChild(opt);
+        });
+        loadAudit();
+    });
+</script>
+{% endblock %}

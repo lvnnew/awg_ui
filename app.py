@@ -13,6 +13,7 @@ import uuid
 import asyncio
 from datetime import datetime, timedelta
 import io
+import csv
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -39,6 +40,16 @@ from managers.s3_backup import (
     test_connection as s3_test_connection,
     validate_backup_config,
 )
+from managers.audit_log import (
+    append_audit,
+    clear_audit_log,
+    default_audit_settings,
+    filter_users,
+    get_audit_settings,
+    list_audit,
+    prune_audit_log,
+    serialize_user_row,
+)
 import telegram_bot as tg_bot
 
 # Configure logging
@@ -56,6 +67,7 @@ OPENAPI_TAGS = [
     {"name": "Self-service", "description": "Endpoints called by a regular user for their own data (the /my surface)."},
     {"name": "Sharing", "description": "Public, token-protected configuration sharing for end users — no panel session required."},
     {"name": "Settings", "description": "Panel-wide settings, Telegram bot, Remnawave sync, JSON backup/restore."},
+    {"name": "Audit", "description": "Admin action audit log (who changed what and when)."},
     {"name": "API Tokens", "description": "Bearer tokens for external integrations. Send the token in `Authorization: Bearer <token>`; tokens have admin-equivalent rights and are tied to the admin user that created them."},
 ]
 
@@ -207,6 +219,7 @@ def load_data():
     data.setdefault('user_connections', [])
     data.setdefault('api_tokens', [])
     data.setdefault('invite_codes', [])
+    data.setdefault('audit_log', [])
     data.setdefault('settings', {
         'appearance': {
             'title': 'Amnezia',
@@ -227,6 +240,7 @@ def load_data():
     # existing installs pick up the default without losing other settings.
     data['settings'].setdefault('notifications', {'server_events': True})
     data['settings'].setdefault('backup', default_backup_settings())
+    data['settings'].setdefault('audit', default_audit_settings())
     # Transparently decrypt secrets so callers always see plaintext.
     _apply_to_secret_fields(data, _dec)
     return data
@@ -419,6 +433,8 @@ def register_user_with_code(code: str, telegram_id: str, first_name: str = '') -
     entry['uses'] = entry.get('uses', 0) + 1
     entry.setdefault('used_by', []).append({'telegram_id': tg_clean, 'at': datetime.now().isoformat()})
 
+    append_audit(data, 'bot', 'user.register', 'user', new_user['id'],
+                 {'username': username, 'invite_code': entry.get('code'), 'telegram_id': tg_clean})
     save_data(data)
     return {'status': 'success', 'user_id': new_user['id'], 'username': username}
 
@@ -1289,6 +1305,11 @@ class BackupSettingsRequest(BaseModel):
     retention_count: int = 30
 
 
+class AuditSettingsRequest(BaseModel):
+    enabled: bool = True
+    retention_days: int = 30
+
+
 class ShareSetupRequest(BaseModel):
     enabled: bool
     password: Optional[str] = None
@@ -1380,6 +1401,15 @@ async def periodic_s3_backup():
             await run_scheduled_s3_backup(manual=False)
         except Exception as e:
             logger.error('periodic_s3_backup loop error: %s', e)
+        try:
+            async with DATA_LOCK:
+                data = load_data()
+                removed = prune_audit_log(data)
+                if removed:
+                    save_data(data)
+                    logger.info('Audit log pruned %s old entries', removed)
+        except Exception as e:
+            logger.error('periodic_audit_prune error: %s', e)
         await asyncio.sleep(300)
 
 
@@ -1452,6 +1482,15 @@ async def startup():
         }
         changed = True
         logger.info("Migrated SSL settings")
+
+    if 'audit' not in data.get('settings', {}):
+        data.setdefault('settings', {})['audit'] = default_audit_settings()
+        changed = True
+
+    pruned = prune_audit_log(data)
+    if pruned:
+        changed = True
+        logger.info('Startup audit prune removed %s entries', pruned)
 
     if changed:
         save_data(data)
@@ -1667,6 +1706,33 @@ async def users_page(request: Request):
     return tpl(request, 'users.html', users=users_list, servers=servers)
 
 
+@app.get('/users/{user_id}', response_class=HTMLResponse, tags=["System Templates"])
+async def user_detail_page(request: Request, user_id: str):
+    cur = get_current_user(request)
+    if not cur:
+        return RedirectResponse(url='/login', status_code=302)
+    if cur['role'] not in ('admin', 'support'):
+        return RedirectResponse(url='/my', status_code=302)
+    data = load_data()
+    target = next((u for u in data.get('users', []) if u['id'] == user_id), None)
+    if not target:
+        return RedirectResponse(url='/users', status_code=302)
+    conns = data.get('user_connections', [])
+    target['connections_count'] = sum(1 for c in conns if c['user_id'] == user_id)
+    profile = serialize_user_row(target, conns)
+    profile['description'] = target.get('description')
+    profile['enabled'] = target.get('enabled', True)
+    return tpl(request, 'user_detail.html', profile=profile, servers=data.get('servers', []))
+
+
+@app.get('/audit', response_class=HTMLResponse, tags=["System Templates"])
+async def audit_page(request: Request):
+    cur = get_current_user(request)
+    if not cur or cur['role'] != 'admin':
+        return RedirectResponse(url='/login', status_code=302)
+    return tpl(request, 'audit.html')
+
+
 @app.get('/my', response_class=HTMLResponse, tags=["System Templates"])
 async def my_connections_page(request: Request):
     user = get_current_user(request)
@@ -1722,6 +1788,7 @@ async def api_login(request: Request, req: LoginRequest):
                 return JSONResponse({'error': _t('account_disabled', lang)}, status_code=403)
             request.session['user_id'] = u['id']
             u['last_login_at'] = datetime.now().isoformat()
+            append_audit(data, u['username'], 'auth.login', 'user', u['id'])
             save_data(data)
             return {'status': 'success', 'role': u['role']}
     lang = request.cookies.get('lang', 'ru')
@@ -1759,6 +1826,18 @@ def _check_admin(request):
     return None
 
 
+def _audit_actor(request, user=None) -> str:
+    u = user or get_current_user(request)
+    return u.get('username', 'unknown') if u else 'system'
+
+
+def _audit(request, data: dict, action: str, target_type: str = '', target_id: str = '',
+           details: dict = None, actor: str = None, force: bool = False):
+    append_audit(
+        data, actor or _audit_actor(request), action, target_type, target_id, details, force=force,
+    )
+
+
 @app.post('/api/servers/add', tags=["Servers"])
 async def api_add_server(request: Request, req: AddServerRequest):
     if not _check_admin(request):
@@ -1788,6 +1867,7 @@ async def api_add_server(request: Request, req: AddServerRequest):
         }
         data = load_data()
         data['servers'].append(server)
+        _audit(request, data, 'server.create', 'server', len(data['servers']) - 1, {'name': name, 'host': host})
         save_data(data)
         _notify_bot(lambda: tg_bot.notify_server_event(bot_services(), 'added', name))
         return {'status': 'success', 'server_id': len(data['servers']) - 1, 'server_info': server_info}
@@ -1843,6 +1923,7 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
         server['password'] = new_pass
         server['private_key'] = new_key
         server['server_info'] = server_info
+        _audit(request, data, 'server.update', 'server', server_id, {'name': new_name, 'host': new_host})
         save_data(data)
         return {'status': 'success', 'server_info': server_info}
     except Exception as e:
@@ -1933,6 +2014,7 @@ async def api_delete_server(request: Request, server_id: int):
         for c in data.get('user_connections', []):
             if c.get('server_id', 0) > server_id:
                 c['server_id'] -= 1
+        _audit(request, data, 'server.delete', 'server', server_id, {'name': removed_name})
         save_data(data)
         _notify_bot(lambda: tg_bot.notify_server_event(bot_services(), 'removed', removed_name))
         return {'status': 'success'}
@@ -2646,61 +2728,104 @@ async def api_toggle_connection(request: Request, server_id: int, req: ToggleCon
 # ======================== USER API (admin only) ========================
 
 @app.get('/api/users', tags=["Users"])
-async def api_list_users(request: Request, search: str = '', page: int = 1, size: int = 10):
+async def api_list_users(
+    request: Request,
+    search: str = '',
+    page: int = 1,
+    size: int = 10,
+    role: str = '',
+    enabled: str = '',
+    inactive_days: int = 0,
+    has_connections: str = '',
+):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
-    all_users = data.get('users', [])
     conns = data.get('user_connections', [])
-    
-    # Filter
-    filtered = []
-    search = search.lower()
-    for u in all_users:
-        if search:
-            match = (search in u['username'].lower() or 
-                     (u.get('email') and search in u['email'].lower()) or 
-                     (u.get('telegramId') and search in str(u['telegramId']).lower()))
-            if not match:
-                continue
-        filtered.append(u)
-        
+    filtered = filter_users(
+        data.get('users', []),
+        conns,
+        search=search,
+        role=role,
+        enabled=enabled,
+        inactive_days=inactive_days,
+        has_connections=has_connections,
+    )
     total = len(filtered)
-    start = (page - 1) * size
+    start = (max(1, page) - 1) * size
     end = start + size
     page_items = filtered[start:end]
-    
-    users = []
-    for u in page_items:
-        users.append({
-            'id': u['id'], 'username': u['username'], 'role': u['role'],
-            'enabled': u.get('enabled', True),
-            'created_at': u.get('created_at', ''),
-            'telegramId': u.get('telegramId'),
-            'email': u.get('email'),
-            'description': u.get('description'),
-            'connections_count': sum(1 for c in conns if c['user_id'] == u['id']),
-            'traffic_used': u.get('traffic_used', 0),
-            'traffic_total': u.get('traffic_total', 0),
-            'traffic_limit': u.get('traffic_limit', 0),
-            'traffic_reset_strategy': u.get('traffic_reset_strategy', 'never'),
-            "expiration_date": u.get("expiration_date"),
-            'share_enabled': u.get('share_enabled', False),
-            'share_token': u.get('share_token'),
-            'has_share_password': bool(u.get('share_password_hash')),
-            'source': 'Remnawave' if u.get('remnawave_uuid') else 'Local',
-            'invite_code': u.get('invite_code'),
-            'last_login_at': u.get('last_login_at'),
-            'last_bot_at': u.get('last_bot_at'),
-            'last_reset_at': u.get('last_reset_at'),
-        })
+    users = [serialize_user_row(u, conns) for u in page_items]
     return {
         'users': users,
         'total': total,
         'page': page,
         'size': size,
-        'pages': (total + size - 1) // size
+        'pages': (total + size - 1) // size if total else 0,
     }
+
+
+@app.get('/api/users/export', tags=["Users"])
+async def api_export_users(
+    request: Request,
+    search: str = '',
+    role: str = '',
+    enabled: str = '',
+    inactive_days: int = 0,
+    has_connections: str = '',
+):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    conns = data.get('user_connections', [])
+    filtered = filter_users(
+        data.get('users', []),
+        conns,
+        search=search,
+        role=role,
+        enabled=enabled,
+        inactive_days=inactive_days,
+        has_connections=has_connections,
+    )
+    buf = io.StringIO()
+    buf.write('\ufeff')
+    writer = csv.writer(buf)
+    writer.writerow([
+        'username', 'role', 'enabled', 'telegram_id', 'email', 'invite_code',
+        'connections', 'traffic_used_bytes', 'traffic_limit_bytes',
+        'last_login_at', 'last_bot_at', 'created_at',
+    ])
+    for u in filtered:
+        row = serialize_user_row(u, conns)
+        writer.writerow([
+            row['username'], row['role'], row['enabled'],
+            row.get('telegramId') or '', row.get('email') or '',
+            row.get('invite_code') or '', row['connections_count'],
+            row.get('traffic_used', 0), row.get('traffic_limit', 0),
+            row.get('last_login_at') or '', row.get('last_bot_at') or '',
+            row.get('created_at') or '',
+        ])
+    filename = f"users-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type='text/csv; charset=utf-8',
+        headers={'Content-Disposition': f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get('/api/audit-log', tags=["Audit"])
+async def api_audit_log(
+    request: Request,
+    search: str = '',
+    action: str = '',
+    page: int = 1,
+    size: int = 50,
+):
+    cur = get_current_user(request)
+    if not cur or cur['role'] != 'admin':
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    return list_audit(data, search=search, action=action, page=page, size=size)
 
 
 @app.post('/api/users/add', tags=["Users"])
@@ -2738,6 +2863,7 @@ async def api_add_user(request: Request, req: AddUserRequest):
             'share_password_hash': None,
         }
         data['users'].append(new_user)
+        _audit(request, data, 'user.create', 'user', new_user['id'], {'username': req.username, 'role': req.role})
         save_data(data)
 
         result = {'status': 'success', 'user_id': new_user['id']}
@@ -2816,6 +2942,7 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
         if req.password:
             user['password_hash'] = hash_password(req.password)
             
+        _audit(request, data, 'user.update', 'user', user_id, {'username': user.get('username')})
         save_data(data)
         
         # Auto re-enable if traffic limit increased beyond usage
@@ -2840,9 +2967,12 @@ async def api_delete_user(request: Request, user_id: str):
         return JSONResponse({'error': _t('cannot_delete_self', lang)}, status_code=400)
     try:
         data = load_data()
+        victim = next((u for u in data['users'] if u['id'] == user_id), None)
         success = await perform_delete_user(data, user_id)
         if not success:
             return JSONResponse({'error': 'User not found'}, status_code=404)
+        _audit(request, data, 'user.delete', 'user', user_id,
+               {'username': victim.get('username') if victim else user_id})
         save_data(data)
         return {'status': 'success'}
     except Exception as e:
@@ -2857,9 +2987,12 @@ async def api_toggle_user(request: Request, user_id: str, req: ToggleUserRequest
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
+        target = next((u for u in data['users'] if u['id'] == user_id), None)
         success = await perform_toggle_user(data, user_id, req.enabled)
         if not success:
             return JSONResponse({'error': 'User not found'}, status_code=404)
+        _audit(request, data, 'user.toggle', 'user', user_id,
+               {'username': target.get('username') if target else user_id, 'enabled': req.enabled})
         save_data(data)
         return {'status': 'success', 'enabled': req.enabled}
     except Exception as e:
@@ -2920,6 +3053,9 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
             }
             data = load_data()
             data['user_connections'].append(conn)
+            _audit(request, data, 'user.connection.add', 'connection', conn['id'],
+                   {'user_id': user_id, 'username': user.get('username'), 'name': req.name,
+                    'protocol': req.protocol, 'server_id': req.server_id})
             save_data(data)
 
         resp = {'status': 'success'}
@@ -3150,6 +3286,7 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
     data['settings']['captcha'] = payload.captcha.dict()
     data['settings']['telegram'] = payload.telegram.dict()
     data['settings']['ssl'] = payload.ssl.dict()
+    _audit(request, data, 'settings.save', 'settings', 'panel')
     save_data(data)
     logger.info("Settings saved (including captcha and telegram)")
 
@@ -3299,6 +3436,7 @@ async def api_create_token(request: Request, req: CreateApiTokenRequest):
     async with DATA_LOCK:
         data = load_data()
         data.setdefault('api_tokens', []).append(entry)
+        _audit(request, data, 'token.create', 'token', token_id, {'name': name})
         save_data(data)
 
     # `token` is returned only here — subsequent reads will not see it.
@@ -3324,6 +3462,7 @@ async def api_revoke_token(request: Request, token_id: str):
         data['api_tokens'] = [t for t in data.get('api_tokens', []) if t.get('id') != token_id]
         if len(data['api_tokens']) == before:
             return JSONResponse({'error': 'Token not found'}, status_code=404)
+        _audit(request, data, 'token.delete', 'token', token_id)
         save_data(data)
     return {'status': 'success'}
 
@@ -3387,6 +3526,8 @@ async def api_create_invite_code(request: Request, req: CreateInviteCodeRequest)
             }
             data.setdefault('invite_codes', []).append(entry)
             created.append(entry)
+        _audit(request, data, 'invite.create', 'invite', '',
+               {'count': len(created), 'codes': [c['code'] for c in created]})
         save_data(data)
     return {'status': 'success', 'codes': [c['code'] for c in created]}
 
@@ -3401,6 +3542,7 @@ async def api_delete_invite_code(request: Request, code: str):
         data['invite_codes'] = [c for c in data.get('invite_codes', []) if str(c.get('code', '')).upper() != code.upper()]
         if len(data['invite_codes']) == before:
             return JSONResponse({'error': 'Code not found'}, status_code=404)
+        _audit(request, data, 'invite.delete', 'invite', code.upper())
         save_data(data)
     return {'status': 'success'}
 
@@ -3464,6 +3606,63 @@ async def api_get_backup_s3_settings(request: Request):
     return public
 
 
+@app.get('/api/settings/audit', tags=["Audit"])
+async def api_get_audit_settings(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    cur = get_current_user(request)
+    if not cur or cur['role'] != 'admin':
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    cfg = get_audit_settings(data)
+    return {
+        **cfg,
+        'entries_count': len(data.get('audit_log') or []),
+    }
+
+
+@app.post('/api/settings/audit/save', tags=["Audit"])
+async def api_save_audit_settings(request: Request, payload: AuditSettingsRequest):
+    cur = get_current_user(request)
+    if not cur or cur['role'] != 'admin':
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    async with DATA_LOCK:
+        data = load_data()
+        retention = max(0, min(int(payload.retention_days), 3650))
+        data.setdefault('settings', {})['audit'] = {
+            'enabled': bool(payload.enabled),
+            'retention_days': retention,
+        }
+        pruned = prune_audit_log(data)
+        _audit(
+            request, data, 'audit.settings', 'settings', 'audit',
+            {'enabled': payload.enabled, 'retention_days': retention, 'pruned': pruned},
+            force=True,
+        )
+        save_data(data)
+    return {
+        'status': 'success',
+        'entries_count': len(data.get('audit_log') or []),
+        'pruned': pruned,
+    }
+
+
+@app.post('/api/settings/audit/clear', tags=["Audit"])
+async def api_clear_audit_log(request: Request):
+    cur = get_current_user(request)
+    if not cur or cur['role'] != 'admin':
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    async with DATA_LOCK:
+        data = load_data()
+        removed = clear_audit_log(data)
+        append_audit(
+            data, _audit_actor(request), 'audit.clear', 'audit', '',
+            {'removed': removed}, force=True,
+        )
+        save_data(data)
+    return {'status': 'success', 'removed': removed, 'entries_count': len(data.get('audit_log') or [])}
+
+
 @app.post('/api/settings/backup/s3/save', tags=["Settings"])
 async def api_save_backup_s3_settings(request: Request, payload: BackupSettingsRequest):
     if not _check_admin(request):
@@ -3507,6 +3706,9 @@ async def api_run_backup_s3(request: Request):
     result = await run_scheduled_s3_backup(manual=True)
     if result.get('status') == 'error':
         return JSONResponse(result, status_code=500)
+    data = load_data()
+    _audit(request, data, 'backup.s3_run', 'settings', 's3', {'folder': result.get('folder')})
+    save_data(data)
     return result
 
 
@@ -3549,6 +3751,10 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
 
         # Save the new data
         async with DATA_LOCK:
+            append_audit(backup_data, _audit_actor(request), 'backup.restore', 'settings', 'data.json', {
+                'users': len(backup_data.get('users', [])),
+                'servers': len(backup_data.get('servers', [])),
+            }, force=True)
             save_data(backup_data)
         
         # In a real app we might want to restart or re-init background tasks

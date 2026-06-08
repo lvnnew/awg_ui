@@ -24,6 +24,31 @@
         {% endif %}
     </div>
 
+    <div class="card" style="margin-bottom: var(--space-md); padding: var(--space-md);">
+        <div style="display:flex; gap: var(--space-sm); flex-wrap: wrap; align-items: center;">
+            <select class="form-select" id="filterRole" style="width:auto; min-width:130px;" onchange="applyFilters()">
+                <option value="">{{ _('filter_role_all') }}</option>
+                <option value="user">{{ _('role_user_desc') }}</option>
+                <option value="support">{{ _('role_support_desc') }}</option>
+                <option value="admin">{{ _('role_admin_desc') }}</option>
+            </select>
+            <select class="form-select" id="filterEnabled" style="width:auto; min-width:130px;" onchange="applyFilters()">
+                <option value="">{{ _('filter_status_all') }}</option>
+                <option value="true">{{ _('filter_status_active') }}</option>
+                <option value="false">{{ _('filter_status_disabled') }}</option>
+            </select>
+            <select class="form-select" id="filterConnections" style="width:auto; min-width:150px;" onchange="applyFilters()">
+                <option value="">{{ _('filter_connections_all') }}</option>
+                <option value="yes">{{ _('filter_connections_yes') }}</option>
+                <option value="no">{{ _('filter_connections_no') }}</option>
+            </select>
+            <input type="number" class="form-input" id="filterInactiveDays" min="0" placeholder="{{ _('filter_inactive_days') }}"
+                style="width:140px;" onchange="applyFilters()">
+            <button type="button" class="btn btn-secondary btn-sm" onclick="resetFilters()">{{ _('filter_reset') }}</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="exportUsersCsv()">📥 CSV</button>
+        </div>
+    </div>
+
     <div id="usersContainer" class="hidden">
         <div class="clients-list" id="usersGrid"
             style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md);">
@@ -387,8 +412,48 @@
     let pageSize = 10;
     let searchQuery = '';
     let searchTimeout = null;
+    let filterRole = '';
+    let filterEnabled = '';
+    let filterConnections = '';
+    let filterInactiveDays = 0;
 
     const serversData = {{ servers | tojson }};
+
+    function usersQueryString() {
+        const p = new URLSearchParams();
+        p.set('search', searchQuery);
+        p.set('page', String(currentPage));
+        p.set('size', String(pageSize));
+        if (filterRole) p.set('role', filterRole);
+        if (filterEnabled) p.set('enabled', filterEnabled);
+        if (filterConnections) p.set('has_connections', filterConnections);
+        if (filterInactiveDays > 0) p.set('inactive_days', String(filterInactiveDays));
+        return p.toString();
+    }
+
+    function applyFilters() {
+        filterRole = document.getElementById('filterRole').value;
+        filterEnabled = document.getElementById('filterEnabled').value;
+        filterConnections = document.getElementById('filterConnections').value;
+        filterInactiveDays = parseInt(document.getElementById('filterInactiveDays').value, 10) || 0;
+        currentPage = 1;
+        refreshUsersList();
+    }
+
+    function resetFilters() {
+        document.getElementById('filterRole').value = '';
+        document.getElementById('filterEnabled').value = '';
+        document.getElementById('filterConnections').value = '';
+        document.getElementById('filterInactiveDays').value = '';
+        filterRole = filterEnabled = filterConnections = '';
+        filterInactiveDays = 0;
+        currentPage = 1;
+        refreshUsersList();
+    }
+
+    function exportUsersCsv() {
+        window.location.href = '/api/users/export?' + usersQueryString();
+    }
 
     function handleSearch(val) {
         clearTimeout(searchTimeout);
@@ -415,7 +480,7 @@
         empty.classList.add('hidden');
 
         try {
-            const data = await apiCall(`/api/users?search=${encodeURIComponent(searchQuery)}&page=${currentPage}&size=${pageSize}`);
+            const data = await apiCall(`/api/users?${usersQueryString()}`);
 
             if (data.users.length === 0) {
                 loading.classList.add('hidden');
@@ -429,7 +494,7 @@
                         <div class="client-avatar">${u.username[0].toUpperCase()}</div>
                         <div>
                             <div class="client-name">
-                                ${u.username}
+                                <a href="/users/${u.id}" style="color:inherit; text-decoration:none; font-weight:600;">${u.username}</a>
                                 <span class="badge badge-${u.role === 'admin' ? 'success' : (u.role === 'support' ? 'info' : 'warn')}" 
                                       style="font-size:0.65rem; margin-left: var(--space-xs);">
                                     ${u.role.toUpperCase()}

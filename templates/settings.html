@@ -418,6 +418,41 @@
             </div>
         </div>
 
+        <!-- BLOCK: Audit log settings -->
+        {% set audit = settings.audit if settings.audit is defined else {} %}
+        <div class="card" style="margin-top: var(--space-lg);">
+            <h3 class="card-title" style="margin-bottom: var(--space-lg);">📋 {{ _('audit_settings_title') }}</h3>
+            <p class="form-hint" style="margin-bottom: var(--space-md);">
+                {{ _('audit_settings_hint') }}
+            </p>
+            <form id="auditSettingsForm">
+                <div class="form-group">
+                    <label class="form-label">
+                        <input type="checkbox" id="audit_enabled" {% if audit.enabled is not defined or audit.enabled %}checked{% endif %}>
+                        {{ _('audit_settings_enabled') }}
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">{{ _('audit_retention_days') }}</label>
+                    <input type="number" class="form-input" id="audit_retention_days" min="0" max="3650"
+                        value="{{ audit.retention_days if audit.retention_days is defined else 30 }}">
+                    <p class="form-hint">{{ _('audit_retention_hint') }}</p>
+                </div>
+            </form>
+            <div class="form-hint" style="margin: var(--space-md) 0; padding: var(--space-sm); border:1px solid var(--border-color); border-radius:8px;">
+                <div><strong>{{ _('audit_entries_count') }}:</strong> <span id="auditEntriesCount">—</span></div>
+            </div>
+            <div style="display:flex; flex-wrap:wrap; gap:var(--space-sm);">
+                <button type="button" class="btn btn-primary" onclick="saveAuditSettings()" id="auditSaveBtn">
+                    <span>💾</span> {{ _('audit_save') }}
+                </button>
+                <button type="button" class="btn btn-danger" onclick="clearAuditLog()" id="auditClearBtn">
+                    <span>🗑</span> {{ _('audit_clear') }}
+                </button>
+                <a href="/audit" class="btn btn-secondary">{{ _('nav_audit') }}</a>
+            </div>
+        </div>
+
         <!-- BLOCK: API Tokens -->
         <div class="card" style="margin-top: var(--space-lg);">
             <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom: var(--space-md);">
@@ -1082,7 +1117,68 @@
         }
     }
 
-    document.addEventListener('DOMContentLoaded', loadInviteCodes);
+    function collectAuditPayload() {
+        return {
+            enabled: document.getElementById('audit_enabled').checked,
+            retention_days: parseInt(document.getElementById('audit_retention_days').value, 10) || 0,
+        };
+    }
+
+    async function refreshAuditStats() {
+        try {
+            const res = await fetch('/api/settings/audit');
+            if (!res.ok) return;
+            const data = await res.json();
+            const el = document.getElementById('auditEntriesCount');
+            if (el) el.textContent = String(data.entries_count ?? '—');
+        } catch (e) { /* ignore */ }
+    }
+
+    async function saveAuditSettings() {
+        const btn = document.getElementById('auditSaveBtn');
+        btn.disabled = true;
+        try {
+            const res = await fetch('/api/settings/audit/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(collectAuditPayload()),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || _('error'));
+            let msg = _('audit_saved');
+            if (data.pruned > 0) {
+                msg += ' (' + _('audit_pruned_count').replace('{}', data.pruned) + ')';
+            }
+            showToast(msg, 'success');
+            refreshAuditStats();
+        } catch (err) {
+            showToast(err.message, 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async function clearAuditLog() {
+        if (!confirm(_('audit_clear_confirm'))) return;
+        const btn = document.getElementById('auditClearBtn');
+        btn.disabled = true;
+        try {
+            const res = await fetch('/api/settings/audit/clear', { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || _('error'));
+            showToast(_('audit_cleared').replace('{}', data.removed || 0), 'success');
+            refreshAuditStats();
+        } catch (err) {
+            showToast(err.message, 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        refreshAuditStats();
+        loadInviteCodes();
+    });
 
     /* ========== Notifications / Broadcast ========== */
     async function loadNotifSettings() {
