@@ -100,6 +100,36 @@
             <hr style="border:none; border-top:1px solid var(--border-color); margin: var(--space-md) 0;">
 
             <div class="form-group">
+                <label class="form-label" style="display:flex; align-items:center; gap:8px;">
+                    <input type="checkbox" id="monitorEnabled" onchange="saveMonitorSettings()">
+                    {{ _('monitor_enabled') }}
+                </label>
+                <p class="form-hint" style="margin-top: var(--space-xs);">
+                    {{ _('monitor_hint') }}
+                </p>
+            </div>
+            <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: var(--space-sm);">
+                <div class="form-group" style="margin:0;">
+                    <label class="form-label" for="monitorInterval">{{ _('monitor_interval') }}</label>
+                    <input type="number" class="form-input" id="monitorInterval" min="15" max="3600" value="60"
+                        onchange="saveMonitorSettings()">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label class="form-label" for="monitorThreshold">{{ _('monitor_threshold') }}</label>
+                    <input type="number" class="form-input" id="monitorThreshold" min="1" max="20" value="2"
+                        onchange="saveMonitorSettings()">
+                </div>
+            </div>
+            <div class="form-group" style="margin-top: var(--space-sm);">
+                <label class="form-label" style="display:flex; align-items:center; gap:8px;">
+                    <input type="checkbox" id="monitorNotifyRecovery" onchange="saveMonitorSettings()" checked>
+                    {{ _('monitor_notify_recovery') }}
+                </label>
+            </div>
+
+            <hr style="border:none; border-top:1px solid var(--border-color); margin: var(--space-md) 0;">
+
+            <div class="form-group">
                 <label class="form-label">Ручная рассылка</label>
                 <textarea class="form-input" id="broadcastText" rows="4"
                     placeholder="Например: Завтра с 02:00 до 03:00 МСК плановые работы, возможны короткие перебои."></textarea>
@@ -1203,6 +1233,48 @@
         } catch (err) { showToast(err.message, 'error'); }
     }
 
+    async function loadMonitorSettings() {
+        try {
+            const res = await fetch('/api/monitor/settings');
+            const data = await res.json();
+            const mon = data.monitor || {};
+            const en = document.getElementById('monitorEnabled');
+            const iv = document.getElementById('monitorInterval');
+            const th = document.getElementById('monitorThreshold');
+            const nr = document.getElementById('monitorNotifyRecovery');
+            if (en) en.checked = !!mon.enabled;
+            if (iv) iv.value = mon.interval_seconds || 60;
+            if (th) th.value = mon.fail_threshold || 2;
+            if (nr) nr.checked = mon.notify_recovery !== false;
+        } catch (err) { /* non-critical */ }
+    }
+
+    async function saveMonitorSettings() {
+        const payload = {
+            enabled: document.getElementById('monitorEnabled').checked,
+            interval_seconds: parseInt(document.getElementById('monitorInterval').value, 10) || 60,
+            fail_threshold: parseInt(document.getElementById('monitorThreshold').value, 10) || 2,
+            notify_recovery: document.getElementById('monitorNotifyRecovery').checked,
+        };
+        try {
+            const res = await fetch('/api/monitor/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json();
+            if (res.ok) {
+                if (data.monitor) {
+                    document.getElementById('monitorInterval').value = data.monitor.interval_seconds;
+                    document.getElementById('monitorThreshold').value = data.monitor.fail_threshold;
+                }
+                showToast('Настройки мониторинга сохранены', 'success');
+            } else {
+                showToast(data.error || 'Не удалось сохранить', 'error');
+            }
+        } catch (err) { showToast(err.message, 'error'); }
+    }
+
     async function sendBroadcast() {
         const text = document.getElementById('broadcastText').value.trim();
         const audience = document.getElementById('broadcastAudience').value;
@@ -1235,6 +1307,9 @@
         }
     }
 
-    document.addEventListener('DOMContentLoaded', loadNotifSettings);
+    document.addEventListener('DOMContentLoaded', () => {
+        loadNotifSettings();
+        loadMonitorSettings();
+    });
 </script>
 {% endblock %}

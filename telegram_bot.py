@@ -290,6 +290,40 @@ async def notify_protocol_event(services: dict, kind: str, server_name: str, pro
     await _notify_infra(services, text)
 
 
+async def notify_server_availability(
+    services: dict,
+    kind: str,
+    server_name: str,
+    host: str,
+    port: int,
+    detail=None,
+) -> None:
+    """Admin-only alert about host reachability (TCP to SSH port). Independent
+    of the server_events toggle that broadcasts inventory changes to everyone."""
+    name = html.escape(server_name or host or "сервер")
+    endpoint = html.escape(f"{host}:{port}")
+    if kind == "down":
+        text = (
+            f"🔴 <b>Сервер недоступен:</b> {name}\n"
+            f"<code>{endpoint}</code>\n"
+            "SSH-порт не отвечает."
+        )
+    elif kind == "up":
+        latency = ""
+        if detail is not None:
+            latency = f"\n~{html.escape(str(detail))} ms"
+        text = (
+            f"🟢 <b>Сервер снова доступен:</b> {name}\n"
+            f"<code>{endpoint}</code>{latency}"
+        )
+    else:
+        return
+    try:
+        await broadcast_message(services, text, audience="admins", parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"notify_server_availability failed: {e}")
+
+
 def _proto_label(proto: str) -> str:
     return _PROTO_LABELS.get(proto, proto.upper())
 

@@ -239,6 +239,7 @@ def load_data():
     # Notification preferences (auto-broadcasts to bot users). Added lazily so
     # existing installs pick up the default without losing other settings.
     data['settings'].setdefault('notifications', {'server_events': True})
+    data['settings'].setdefault('monitor', default_monitor_settings())
     data['settings'].setdefault('backup', default_backup_settings())
     data['settings'].setdefault('audit', default_audit_settings())
     # Transparently decrypt secrets so callers always see plaintext.
@@ -602,10 +603,20 @@ def bot_services() -> dict:
     }
 
 
+def default_monitor_settings() -> dict:
+    return {
+        'enabled': True,
+        'interval_seconds': 60,
+        'fail_threshold': 2,
+        'notify_recovery': True,
+    }
+
+
 def get_servers_status() -> list:
     """Quick reachability + latency check for every server, used by the bot's
-    'Status' button. Uses a parallel TCP connect to the SSH port (fast, no auth,
-    no ICMP perms needed). Blocking — bot must call via asyncio.to_thread."""
+    'Status' button and the background availability monitor. Uses a parallel TCP
+    connect to the SSH port (fast, no auth, no ICMP perms needed). Blocking —
+    callers must use asyncio.to_thread."""
     import socket, time, concurrent.futures
     data = load_data()
     servers = data.get('servers', [])
@@ -623,6 +634,8 @@ def get_servers_status() -> list:
             pass
         return {
             'name': s.get('name') or host,
+            'host': host,
+            'ssh_port': port,
             'online': online,
             'ping_ms': ping_ms,
             'protocols': [p for p in s.get('protocols', {}).keys()],
@@ -1292,6 +1305,13 @@ class NotificationSettingsRequest(BaseModel):
     server_events: bool = True
 
 
+class MonitorSettingsRequest(BaseModel):
+    enabled: bool = True
+    interval_seconds: int = 60
+    fail_threshold: int = 2
+    notify_recovery: bool = True
+
+
 class BackupSettingsRequest(BaseModel):
     enabled: bool = False
     endpoint_url: str = ''
@@ -1413,6 +1433,85 @@ async def periodic_s3_backup():
         await asyncio.sleep(300)
 
 
+# In-memory TCP reachability state for admin Telegram alerts.
+# key = "host:port" -> {fails, alerted}
+_monitor_state: dict = {}
+_monitor_primed = False
+
+
+def _monitor_server_key(row: dict) -> str:
+    host = row.get('host') or ''
+    port = int(row.get('ssh_port', 22) or 22)
+    return f'{host}:{port}'
+
+
+def _apply_monitor_probe(results: list, threshold: int, notify_recovery: bool):
+    """Update in-memory monitor state and fire admin alerts on transitions.
+    First successful cycle only primes baseline (no mass down/up spam)."""
+    global _monitor_primed
+    seen = set()
+    for row in results:
+        key = _monitor_server_key(row)
+        if not row.get('host'):
+            continue
+        seen.add(key)
+        st = _monitor_state.setdefault(key, {'fails': 0, 'alerted': False})
+        name = row.get('name') or row.get('host')
+        host = row.get('host')
+        port = int(row.get('ssh_port', 22) or 22)
+        online = bool(row.get('online'))
+
+        if not _monitor_primed:
+            st['fails'] = 0 if online else threshold
+            st['alerted'] = not online
+            continue
+
+        if online:
+            was_alerted = st.get('alerted')
+            st['fails'] = 0
+            if was_alerted:
+                st['alerted'] = False
+                if notify_recovery:
+                    ping_ms = row.get('ping_ms')
+                    _notify_bot(lambda n=name, h=host, p=port, ms=ping_ms: tg_bot.notify_server_availability(
+                        bot_services(), 'up', n, h, p, detail=ms,
+                    ))
+            continue
+
+        st['fails'] = int(st.get('fails') or 0) + 1
+        if st['fails'] >= threshold and not st.get('alerted'):
+            st['alerted'] = True
+            _notify_bot(lambda n=name, h=host, p=port: tg_bot.notify_server_availability(
+                bot_services(), 'down', n, h, p,
+            ))
+
+    for stale in list(_monitor_state.keys()):
+        if stale not in seen:
+            _monitor_state.pop(stale, None)
+
+    if not _monitor_primed and results is not None:
+        _monitor_primed = True
+
+
+async def periodic_server_monitor():
+    """Poll SSH-port TCP reachability and notify admins on outages/recovery."""
+    await asyncio.sleep(30)
+    while True:
+        interval = 60
+        try:
+            data = load_data()
+            mon = {**default_monitor_settings(), **(data.get('settings', {}).get('monitor') or {})}
+            interval = max(15, int(mon.get('interval_seconds', 60) or 60))
+            threshold = max(1, int(mon.get('fail_threshold', 2) or 2))
+            notify_recovery = bool(mon.get('notify_recovery', True))
+            if mon.get('enabled', True):
+                results = await asyncio.to_thread(get_servers_status)
+                _apply_monitor_probe(results, threshold, notify_recovery)
+        except Exception as e:
+            logger.error('periodic_server_monitor loop error: %s', e)
+        await asyncio.sleep(interval)
+
+
 # ======================== Startup ========================
 
 @app.on_event("startup")
@@ -1498,6 +1597,7 @@ async def startup():
     # Start periodic background tasks
     asyncio.create_task(periodic_background_tasks())
     asyncio.create_task(periodic_s3_backup())
+    asyncio.create_task(periodic_server_monitor())
 
     # Start Telegram bot if enabled
     tg_cfg = data.get('settings', {}).get('telegram', {})
@@ -3587,6 +3687,39 @@ async def api_broadcast(request: Request, req: BroadcastRequest):
     if result.get('error'):
         return JSONResponse({'error': result['error']}, status_code=400)
     return {'status': 'success', **result}
+
+
+@app.get('/api/monitor/settings', tags=["Settings"])
+async def api_get_monitor_settings(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    mon = {**default_monitor_settings(), **(data.get('settings', {}).get('monitor') or {})}
+    return {'monitor': {
+        'enabled': bool(mon.get('enabled', True)),
+        'interval_seconds': int(mon.get('interval_seconds', 60) or 60),
+        'fail_threshold': int(mon.get('fail_threshold', 2) or 2),
+        'notify_recovery': bool(mon.get('notify_recovery', True)),
+    }}
+
+
+@app.post('/api/monitor/settings', tags=["Settings"])
+async def api_set_monitor_settings(request: Request, req: MonitorSettingsRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    interval = max(15, min(3600, int(req.interval_seconds or 60)))
+    threshold = max(1, min(20, int(req.fail_threshold or 2)))
+    payload = {
+        'enabled': bool(req.enabled),
+        'interval_seconds': interval,
+        'fail_threshold': threshold,
+        'notify_recovery': bool(req.notify_recovery),
+    }
+    async with DATA_LOCK:
+        data = load_data()
+        data.setdefault('settings', {})['monitor'] = payload
+        save_data(data)
+    return {'status': 'success', 'monitor': payload}
 
 
 @app.get('/api/settings/backup/s3', tags=["Settings"])

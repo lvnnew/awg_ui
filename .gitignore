@@ -41,3 +41,4 @@ _ops/
 # IDEs
 .vscode/
 .idea/
+.cursor/
