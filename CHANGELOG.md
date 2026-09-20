@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+## [2026-09-20] — Telemt: лимит docker-логов
+
+### Changed
+- В `protocol_telemt/docker-compose.yml` — ротация логов контейнера
+  (`json-file`, max-size 10m × 3), чтобы stdout не забивал диск.
+
 ## [2026-08-11] — Мониторинг доступности серверов (TCP)
 
 ### Added

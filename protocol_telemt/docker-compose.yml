@@ -15,6 +15,13 @@ services:
       - /run/telemt:rw,mode=1777,size=1m
     environment:
       - RUST_LOG=info
+    # Cap container stdout/stderr so chatty INFO (handshakes) cannot fill the disk.
+    # Daemon defaults alone do not apply to already-created containers.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # Uncomment this line if you want to use host network for IPv6, but bridge is default and usually better
     # network_mode: host
     cap_drop:
