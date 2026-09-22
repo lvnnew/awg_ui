@@ -389,9 +389,41 @@ def parse_awg_show(output: str) -> list[dict]:
     return peers
 
 
+def parse_size_to_bytes(value) -> int:
+    """Parse int bytes or human sizes like '283.37 GiB' / '12.5 MiB'."""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value).strip().replace(",", ".")
+    if not s:
+        return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        pass
+    m = re.match(r"^([\d.]+)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)?$", s, re.I)
+    if not m:
+        return 0
+    num = float(m.group(1))
+    unit = (m.group(2) or "B").upper()
+    mult = {
+        "B": 1,
+        "KIB": 1024,
+        "KB": 1000,
+        "MIB": 1024**2,
+        "MB": 1000**2,
+        "GIB": 1024**3,
+        "GB": 1000**3,
+        "TIB": 1024**4,
+        "TB": 1000**4,
+    }.get(unit, 1)
+    return int(num * mult)
+
+
 def format_age(seconds: Optional[int]) -> str:
     if seconds is None:
-        return "никогда"
+        return "никогда / сброс счётчиков"
     s = int(seconds)
     days, rem = divmod(s, 86400)
     hours, rem = divmod(rem, 3600)
@@ -410,18 +442,33 @@ def evaluate_handshake_symptom(
     peers: list[dict],
     stale_hours: float = 6.0,
     name_by_key: Optional[dict] = None,
+    lifetime_bytes_by_key: Optional[dict] = None,
 ) -> Optional[dict]:
-    """If peers look unreachable, return structured symptom details."""
+    """If peers look unreachable, return structured symptom details.
+
+    History comes from live `wg/awg show` transfer **or** lifetime counters in
+    clientsTable (survive container remaps that zero WireGuard stats — PL1 case).
+    """
     stale_sec = max(1.0, float(stale_hours)) * 3600
-    with_history = [p for p in peers if (p.get("transfer") or 0) > 0]
+    names = name_by_key or {}
+    lifetime = lifetime_bytes_by_key or {}
+
+    with_history = []
+    for p in peers:
+        key = p.get("public_key") or ""
+        live = int(p.get("transfer") or 0)
+        hist = int(lifetime.get(key) or 0)
+        if live > 0 or hist > 0:
+            with_history.append({**p, "lifetime_bytes": hist, "live_transfer": live})
     if not with_history:
         return None
+
+    # Any recent handshake among historically-used peers → healthy
     for p in with_history:
         age = p.get("handshake_age")
         if age is not None and age < stale_sec:
             return None
 
-    names = name_by_key or {}
     stale_peers = []
     for p in with_history:
         key = p.get("public_key") or ""
@@ -431,13 +478,22 @@ def evaluate_handshake_symptom(
             "public_key": key,
             "age_seconds": age,
             "age_label": format_age(age),
-            "transfer": p.get("transfer") or 0,
+            "transfer": p.get("live_transfer") or 0,
+            "lifetime_bytes": p.get("lifetime_bytes") or 0,
         })
-    oldest = max((p.get("age_seconds") or 10**9) for p in stale_peers)
+
+    ages = [p["age_seconds"] for p in stale_peers if p["age_seconds"] is not None]
+    oldest = max(ages) if ages else None
+    # If all handshakes missing after remap, still treat as fully silent.
+    if oldest is None:
+        code = "peers_silent_after_reset"
+    else:
+        code = "no_handshake"
+
     return {
-        "code": "no_handshake",
+        "code": code,
         "stale_count": len(stale_peers),
-        "oldest_seconds": oldest if oldest < 10**9 else None,
+        "oldest_seconds": oldest,
         "threshold_hours": float(stale_hours),
         "peers": stale_peers,
     }
@@ -449,17 +505,25 @@ def humanize_handshake_symptom(proto: str, sym: dict) -> str:
     names_s = ", ".join(names[:5])
     if len(names) > 5:
         names_s += f" и ещё {len(names) - 5}"
-    age = format_age(sym.get("oldest_seconds"))
     thr = sym.get("threshold_hours") or 6
+    n = sym.get("stale_count", 0)
+    if sym.get("code") == "peers_silent_after_reset":
+        return (
+            f"{proto}: {n} клиент(ов) раньше имели трафик, но сейчас нет ни одного "
+            f"handshake (счётчики WG обнулены — типично после рестарта/ремапа; "
+            f"с РФ, скорее всего, UDP не доходит)"
+            + (f" — {names_s}" if names_s else "")
+        )
+    age = format_age(sym.get("oldest_seconds"))
     return (
-        f"{proto}: нет живого handshake ≥{thr}ч у {sym.get('stale_count', 0)} "
+        f"{proto}: нет живого handshake ≥{thr}ч у {n} "
         f"клиент(ов) с трафиком (давность до {age})"
         + (f" — {names_s}" if names_s else "")
     )
 
 
-def load_awg_client_names(ssh, container: str) -> dict:
-    """Map peer public key → clientName from clientsTable JSON."""
+def load_awg_clients_meta(ssh, container: str) -> dict:
+    """Return {public_key: {name, lifetime_bytes}} from clientsTable."""
     import json as _json
 
     cmd = f"docker exec {container} cat /opt/amnezia/awg/clientsTable 2>/dev/null"
@@ -476,15 +540,31 @@ def load_awg_client_names(ssh, container: str) -> dict:
         rows = _json.loads(out)
     except Exception:
         return {}
-    names = {}
+    meta = {}
     if isinstance(rows, list):
         for row in rows:
             cid = row.get("clientId") or row.get("public_key")
+            if not cid:
+                continue
             ud = row.get("userData") or {}
-            name = ud.get("clientName") or row.get("clientName")
-            if cid and name:
-                names[cid] = name
-    return names
+            name = ud.get("clientName") or row.get("clientName") or ""
+            rx = parse_size_to_bytes(
+                ud.get("dataReceivedBytes", ud.get("dataReceived"))
+            )
+            tx = parse_size_to_bytes(
+                ud.get("dataSentBytes", ud.get("dataSent"))
+            )
+            meta[cid] = {"name": name, "lifetime_bytes": rx + tx}
+    return meta
+
+
+def load_awg_client_names(ssh, container: str) -> dict:
+    """Map peer public key → clientName from clientsTable JSON."""
+    return {
+        k: (v.get("name") or "")
+        for k, v in load_awg_clients_meta(ssh, container).items()
+        if v.get("name")
+    }
 
 
 def resolve_host_ipv4(host: str) -> Optional[str]:
@@ -558,12 +638,19 @@ def check_server_handshakes(ssh, protocols: dict, stale_hours: float = 6.0) -> d
         if not out:
             continue
         peers = parse_awg_show(out)
-        names = load_awg_client_names(ssh, container)
-        sym = evaluate_handshake_symptom(peers, stale_hours=stale_hours, name_by_key=names)
+        meta = load_awg_clients_meta(ssh, container)
+        names = {k: (v.get("name") or "") for k, v in meta.items() if v.get("name")}
+        lifetime = {k: int(v.get("lifetime_bytes") or 0) for k, v in meta.items()}
+        sym = evaluate_handshake_symptom(
+            peers,
+            stale_hours=stale_hours,
+            name_by_key=names,
+            lifetime_bytes_by_key=lifetime,
+        )
         if sym:
             line = humanize_handshake_symptom(proto, sym)
             reasons.append(
-                f"{proto}:no_handshake:{sym['stale_count']}_peers_stale>={format_age(sym.get('oldest_seconds'))}"
+                f"{proto}:{sym.get('code')}:{sym['stale_count']}_peers"
             )
             summaries.append(line)
             details.append({
