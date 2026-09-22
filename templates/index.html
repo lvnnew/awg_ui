@@ -31,6 +31,10 @@
                         <span class="ping-ms text-muted" id="ping-ms-{{ loop.index0 }}"></span>
                     </div>
                     <div class="server-host">{{ server.host }}:{{ server.ssh_port }}</div>
+                    <div class="server-traffic" id="traffic-{{ loop.index0 }}" title="{{ _('server_traffic_live') }}">
+                        <span class="tr-down">↓ —</span>
+                        <span class="tr-up">↑ —</span>
+                    </div>
                     <div class="server-status-badges" id="rkn-badge-{{ loop.index0 }}" style="margin-top:6px;"></div>
                 </div>
             </div>
@@ -365,6 +369,70 @@
         });
     }
 
+    /* ========== Live NIC traffic rates on tiles ========== */
+    const _netPrev = {}; // id -> {rx, tx, t}
+    const TRAFFIC_POLL_MS = 5000;
+
+    function formatRate(bps) {
+        if (bps == null || !isFinite(bps) || bps < 0) return '—';
+        const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+        let v = bps;
+        let i = 0;
+        while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+        const digits = v >= 100 || i === 0 ? 0 : (v >= 10 ? 1 : 2);
+        return v.toFixed(digits) + ' ' + units[i];
+    }
+
+    function renderTraffic(id, downBps, upBps) {
+        const el = document.getElementById('traffic-' + id);
+        if (!el) return;
+        const d = el.querySelector('.tr-down');
+        const u = el.querySelector('.tr-up');
+        if (d) d.textContent = '↓ ' + formatRate(downBps);
+        if (u) u.textContent = '↑ ' + formatRate(upBps);
+        el.classList.toggle('is-active', (downBps || 0) + (upBps || 0) > 1024);
+    }
+
+    async function pollNetTraffic() {
+        if (document.visibilityState === 'hidden') return;
+        try {
+            const rows = await apiCall('/api/servers/net_traffic');
+            if (!Array.isArray(rows)) return;
+            const now = performance.now() / 1000;
+            rows.forEach(row => {
+                const id = row.id;
+                const el = document.getElementById('traffic-' + id);
+                if (!el) return;
+                if (!row.ok) {
+                    renderTraffic(id, null, null);
+                    el.title = row.error || 'offline';
+                    return;
+                }
+                const prev = _netPrev[id];
+                _netPrev[id] = { rx: row.net_rx, tx: row.net_tx, t: now };
+                if (!prev) {
+                    renderTraffic(id, 0, 0);
+                    return;
+                }
+                const dt = Math.max(0.5, now - prev.t);
+                // Counters can reset on reboot — ignore negative deltas
+                let down = (row.net_rx - prev.rx) / dt;
+                let up = (row.net_tx - prev.tx) / dt;
+                if (down < 0 || up < 0) { down = 0; up = 0; }
+                renderTraffic(id, down, up);
+                el.title = 'RX ' + formatRate(down) + ' · TX ' + formatRate(up);
+            });
+        } catch (e) { /* non-critical */ }
+    }
+
+    function startTrafficPolling() {
+        pollNetTraffic();
+        setInterval(pollNetTraffic, TRAFFIC_POLL_MS);
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') pollNetTraffic();
+        });
+    }
+
     /* ========== Drag-and-drop reorder ========== */
 
     let draggedCard = null;
@@ -465,6 +533,7 @@
         startAllPings();
         setupDragAndDrop();
         loadFleetRknBadges();
+        startTrafficPolling();
     });
 </script>
 {% endblock %}

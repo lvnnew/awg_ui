@@ -347,5 +347,6 @@
     "settings_sec_access": "Access",
     "settings_sec_about": "About",
     "servers_page_desc": "VPN server fleet",
-    "notif_card_title": "Notifications"
+    "notif_card_title": "Notifications",
+    "server_traffic_live": "Live interface traffic rate"
 }

@@ -2085,6 +2085,75 @@ async def api_servers_status(request: Request):
     return results
 
 
+def _read_server_net_counters(server: dict) -> dict:
+    """Read default-iface RX/TX byte counters via a short SSH session."""
+    import time as _time
+    host = server.get('host') or ''
+    ssh = None
+    try:
+        ssh = get_ssh(server)
+        ssh.connect()
+        out, _err, code = ssh.run_command(
+            "DEV=$(ip route | awk '/default/ {print $5}' | head -1); "
+            "cat /proc/net/dev | awk -v dev=\"$DEV:\" '$1==dev{printf \"%d %d\", $2, $10}'",
+            timeout=15,
+        )
+        rx = tx = 0
+        if code == 0 and out:
+            parts = out.strip().split()
+            if len(parts) >= 2:
+                rx, tx = int(parts[0]), int(parts[1])
+        return {
+            'host': host,
+            'ok': True,
+            'net_rx': rx,
+            'net_tx': tx,
+            'ts': _time.time(),
+        }
+    except Exception as e:
+        return {
+            'host': host,
+            'ok': False,
+            'error': str(e),
+            'net_rx': 0,
+            'net_tx': 0,
+            'ts': _time.time(),
+        }
+    finally:
+        try:
+            if ssh:
+                ssh.disconnect()
+        except Exception:
+            pass
+
+
+@app.get('/api/servers/net_traffic', tags=["Servers"])
+async def api_servers_net_traffic(request: Request):
+    """Lightweight NIC counters for all servers (for live rates on fleet tiles)."""
+    cur = get_current_user(request)
+    if not cur or cur['role'] not in ('admin', 'support'):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    servers = data.get('servers') or []
+    if not servers:
+        return []
+
+    def run_all():
+        import concurrent.futures
+
+        def one(item):
+            idx, server = item
+            row = _read_server_net_counters(server)
+            row['id'] = idx
+            row['name'] = server.get('name') or server.get('host')
+            return row
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(servers), 10)) as ex:
+            return list(ex.map(one, enumerate(servers)))
+
+    return await asyncio.to_thread(run_all)
+
+
 @app.get('/my', response_class=HTMLResponse, tags=["System Templates"])
 async def my_connections_page(request: Request):
     user = get_current_user(request)

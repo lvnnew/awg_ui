@@ -554,6 +554,30 @@ a:hover {
     font-family: 'SF Mono', 'Fira Code', monospace;
 }
 
+.server-card .server-traffic {
+    display: flex;
+    gap: 10px;
+    margin-top: 4px;
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.server-card .server-traffic.is-active {
+    color: var(--text-secondary);
+}
+
+.server-card .server-traffic .tr-down {
+    color: var(--success);
+    opacity: 0.85;
+}
+
+.server-card .server-traffic .tr-up {
+    color: var(--info);
+    opacity: 0.85;
+}
+
 .server-card .server-protocols {
     display: flex;
     gap: var(--space-sm);

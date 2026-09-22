@@ -462,5 +462,6 @@
     "settings_sec_access": "Доступ",
     "settings_sec_about": "О панели",
     "servers_page_desc": "Флот VPN-серверов",
-    "notif_card_title": "Уведомления"
+    "notif_card_title": "Уведомления",
+    "server_traffic_live": "Трафик на интерфейсе в реальном времени"
 }
