@@ -130,6 +130,65 @@
             <hr style="border:none; border-top:1px solid var(--border-color); margin: var(--space-md) 0;">
 
             <div class="form-group">
+                <label class="form-label" style="display:flex; align-items:center; gap:8px;">
+                    <input type="checkbox" id="rknEnabled" onchange="saveRknMonitorSettings()">
+                    {{ _('rkn_monitor_enabled') }}
+                </label>
+                <p class="form-hint" style="margin-top: var(--space-xs);">
+                    {{ _('rkn_monitor_hint') }}
+                </p>
+            </div>
+            <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: var(--space-sm);">
+                <div class="form-group" style="margin:0;">
+                    <label class="form-label" for="rknInterval">{{ _('rkn_monitor_interval') }}</label>
+                    <input type="number" class="form-input" id="rknInterval" min="300" max="86400" value="900"
+                        onchange="saveRknMonitorSettings()">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label class="form-label" for="rknDumpRefresh">{{ _('rkn_monitor_dump_refresh') }}</label>
+                    <input type="number" class="form-input" id="rknDumpRefresh" min="3600" max="604800" value="14400"
+                        onchange="saveRknMonitorSettings()">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label class="form-label" for="rknThreshold">{{ _('rkn_monitor_threshold') }}</label>
+                    <input type="number" class="form-input" id="rknThreshold" min="1" max="20" value="2"
+                        onchange="saveRknMonitorSettings()">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label class="form-label" for="rknStaleHours">{{ _('rkn_monitor_stale_hours') }}</label>
+                    <input type="number" class="form-input" id="rknStaleHours" min="1" max="168" value="6"
+                        onchange="saveRknMonitorSettings()">
+                </div>
+            </div>
+            <div class="form-group" style="margin-top: var(--space-sm);">
+                <label class="form-label" style="display:flex; align-items:center; gap:8px;">
+                    <input type="checkbox" id="rknCheckRegistry" onchange="saveRknMonitorSettings()" checked>
+                    {{ _('rkn_monitor_check_registry') }}
+                </label>
+            </div>
+            <div class="form-group" style="margin-top: var(--space-xs);">
+                <label class="form-label" style="display:flex; align-items:center; gap:8px;">
+                    <input type="checkbox" id="rknCheckHandshake" onchange="saveRknMonitorSettings()" checked>
+                    {{ _('rkn_monitor_check_handshake') }}
+                </label>
+            </div>
+            <div class="form-group" style="margin-top: var(--space-xs);">
+                <label class="form-label" style="display:flex; align-items:center; gap:8px;">
+                    <input type="checkbox" id="rknNotifyClear" onchange="saveRknMonitorSettings()" checked>
+                    {{ _('rkn_monitor_notify_clear') }}
+                </label>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top: var(--space-sm);">
+                <button type="button" class="btn btn-secondary" id="rknCheckNowBtn" onclick="rknCheckNow()">
+                    <span id="rknCheckNowText">{{ _('rkn_monitor_check_now') }}</span>
+                    <span id="rknCheckNowSpin" class="hidden">⏳</span>
+                </button>
+                <span class="form-hint" id="rknStatusHint" style="margin:0;"></span>
+            </div>
+
+            <hr style="border:none; border-top:1px solid var(--border-color); margin: var(--space-md) 0;">
+
+            <div class="form-group">
                 <label class="form-label">Ручная рассылка</label>
                 <textarea class="form-input" id="broadcastText" rows="4"
                     placeholder="Например: Завтра с 02:00 до 03:00 МСК плановые работы, возможны короткие перебои."></textarea>
@@ -1277,6 +1336,99 @@
         } catch (err) { showToast(err.message, 'error'); }
     }
 
+    async function loadRknMonitorSettings() {
+        try {
+            const res = await fetch('/api/rkn_monitor/settings');
+            const data = await res.json();
+            const cfg = data.rkn_monitor || {};
+            const set = (id, val, isCheck) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                if (isCheck) el.checked = !!val; else el.value = val;
+            };
+            set('rknEnabled', cfg.enabled !== false, true);
+            set('rknInterval', cfg.interval_seconds || 900);
+            set('rknDumpRefresh', cfg.dump_refresh_seconds || 14400);
+            set('rknThreshold', cfg.fail_threshold || 2);
+            set('rknStaleHours', cfg.handshake_stale_hours || 6);
+            set('rknCheckRegistry', cfg.check_registry !== false, true);
+            set('rknCheckHandshake', cfg.check_handshake !== false, true);
+            set('rknNotifyClear', cfg.notify_clear !== false, true);
+            const st = data.status || {};
+            const hint = document.getElementById('rknStatusHint');
+            if (hint) {
+                const dump = st.dump_ready
+                    ? ('dump: ' + (st.dump_exact || 0) + ' IP, ' + (st.dump_networks || 0) + ' CIDR')
+                    : 'dump: ещё не загружен';
+                const bad = (st.last_results || []).filter(r => r.level && r.level !== 'ok');
+                hint.textContent = dump + (bad.length ? ('; · проблем: ' + bad.length) : '');
+            }
+        } catch (err) { /* non-critical */ }
+    }
+
+    async function saveRknMonitorSettings() {
+        const payload = {
+            enabled: document.getElementById('rknEnabled').checked,
+            interval_seconds: parseInt(document.getElementById('rknInterval').value, 10) || 900,
+            dump_refresh_seconds: parseInt(document.getElementById('rknDumpRefresh').value, 10) || 14400,
+            fail_threshold: parseInt(document.getElementById('rknThreshold').value, 10) || 2,
+            handshake_stale_hours: parseInt(document.getElementById('rknStaleHours').value, 10) || 6,
+            check_registry: document.getElementById('rknCheckRegistry').checked,
+            check_handshake: document.getElementById('rknCheckHandshake').checked,
+            notify_clear: document.getElementById('rknNotifyClear').checked,
+        };
+        try {
+            const res = await fetch('/api/rkn_monitor/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json();
+            if (res.ok) {
+                if (data.rkn_monitor) {
+                    document.getElementById('rknInterval').value = data.rkn_monitor.interval_seconds;
+                    document.getElementById('rknDumpRefresh').value = data.rkn_monitor.dump_refresh_seconds;
+                    document.getElementById('rknThreshold').value = data.rkn_monitor.fail_threshold;
+                    document.getElementById('rknStaleHours').value = data.rkn_monitor.handshake_stale_hours;
+                }
+                showToast('Настройки РКН-мониторинга сохранены', 'success');
+            } else {
+                showToast(data.error || 'Не удалось сохранить', 'error');
+            }
+        } catch (err) { showToast(err.message, 'error'); }
+    }
+
+    async function rknCheckNow() {
+        const btn = document.getElementById('rknCheckNowBtn');
+        const txt = document.getElementById('rknCheckNowText');
+        const spin = document.getElementById('rknCheckNowSpin');
+        if (btn) btn.disabled = true;
+        if (txt) txt.classList.add('hidden');
+        if (spin) spin.classList.remove('hidden');
+        try {
+            const res = await fetch('/api/rkn_monitor/check_now', { method: 'POST' });
+            const data = await res.json();
+            if (res.ok) {
+                const bad = (data.results || []).filter(r => r.level && r.level !== 'ok');
+                showToast(
+                    bad.length
+                        ? ('Проверка: проблем ' + bad.length + ' из ' + (data.results || []).length)
+                        : ('Проверка: все OK (' + (data.results || []).length + ')'),
+                    bad.length ? 'error' : 'success'
+                );
+                await loadRknMonitorSettings();
+            } else {
+                showToast(data.error || 'Ошибка проверки', 'error');
+            }
+        } catch (err) {
+            showToast(err.message, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+            if (txt) txt.classList.remove('hidden');
+            if (spin) spin.classList.add('hidden');
+        }
+    }
+
     async function sendBroadcast() {
         const text = document.getElementById('broadcastText').value.trim();
         const audience = document.getElementById('broadcastAudience').value;
@@ -1312,6 +1464,7 @@
     document.addEventListener('DOMContentLoaded', () => {
         loadNotifSettings();
         loadMonitorSettings();
+        loadRknMonitorSettings();
     });
 </script>
 {% endblock %}

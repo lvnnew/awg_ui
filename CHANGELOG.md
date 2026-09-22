@@ -12,6 +12,11 @@
   образ `amneziavpn/amneziawg-go:3.1.20260828`): Header Protection,
   RandomTrailers, ContentPadding, таймеры. Без миграции существующих `awg`/`awg2`.
   Клиентам нужен AmneziaVPN ≥ 5.0.1.5.
+- **Мониторинг блокировок РКН**: фоновая сверка IP серверов с dump zapret-info
+  (`/24` → at_risk, точное попадание → blocked) и симптом «застывший» handshake
+  AmneziaWG при живых peers. Алерты только админам в Telegram. Settings +
+  `GET/POST /api/rkn_monitor/settings`, `POST /api/rkn_monitor/check_now`.
+  Кэш dump: `{DATA_DIR}/rkn_cache/`.
 
 ## [2026-09-20] — Telemt: лимит docker-логов
 

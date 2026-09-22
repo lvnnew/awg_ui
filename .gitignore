@@ -33,6 +33,7 @@ data.json
 # Local data backups / dumps (may contain plaintext secrets) — never commit
 _backup_*.json
 data.json.bak*
+rkn_cache/
 .DS_Store
 
 # Ad-hoc ops scripts (contain server credentials) — never commit

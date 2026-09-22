@@ -33,6 +33,15 @@ from managers.ssh_manager import SSHManager
 from managers.awg_manager import AWGManager
 from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
+from managers.rkn_monitor import (
+    cache_dir_for_data_file,
+    check_server_handshakes,
+    check_server_registry,
+    default_rkn_monitor_settings,
+    ensure_dump_index,
+    get_dump_index,
+    merge_levels,
+)
 from managers.s3_backup import (
     default_backup_settings,
     list_recent_backups,
@@ -240,6 +249,7 @@ def load_data():
     # existing installs pick up the default without losing other settings.
     data['settings'].setdefault('notifications', {'server_events': True})
     data['settings'].setdefault('monitor', default_monitor_settings())
+    data['settings'].setdefault('rkn_monitor', default_rkn_monitor_settings())
     data['settings'].setdefault('backup', default_backup_settings())
     data['settings'].setdefault('audit', default_audit_settings())
     # Transparently decrypt secrets so callers always see plaintext.
@@ -1312,6 +1322,18 @@ class MonitorSettingsRequest(BaseModel):
     notify_recovery: bool = True
 
 
+class RknMonitorSettingsRequest(BaseModel):
+    enabled: bool = True
+    interval_seconds: int = 900
+    dump_refresh_seconds: int = 14400
+    fail_threshold: int = 2
+    check_registry: bool = True
+    check_handshake: bool = True
+    handshake_stale_hours: int = 6
+    notify_clear: bool = True
+    dump_url: str = ''
+
+
 class BackupSettingsRequest(BaseModel):
     enabled: bool = False
     endpoint_url: str = ''
@@ -1512,6 +1534,181 @@ async def periodic_server_monitor():
         await asyncio.sleep(interval)
 
 
+# In-memory RKN monitor state: key = host -> {level, fails, alerted_level, last}
+_rkn_state: dict = {}
+_rkn_primed = False
+_rkn_last_results: list = []
+
+
+def _probe_server_rkn(server: dict, cfg: dict, index) -> dict:
+    """Blocking single-server RKN check (registry + optional handshake)."""
+    name = server.get('name') or server.get('host') or '?'
+    host = server.get('host') or ''
+    reasons = []
+    ip = None
+    reg_level = 'ok'
+    hs_level = 'ok'
+
+    if cfg.get('check_registry', True) and index is not None:
+        try:
+            reg = check_server_registry(index, host)
+            reg_level = reg.get('level') or 'ok'
+            ip = reg.get('ip')
+            reasons.extend(reg.get('reasons') or [])
+        except Exception as e:
+            reasons.append(f'registry_error:{e}')
+
+    if cfg.get('check_handshake', True):
+        protocols = server.get('protocols') or {}
+        if any(p in protocols for p in ('awg', 'awg3', 'awg2', 'awg_legacy')):
+            ssh = None
+            try:
+                ssh = get_ssh(server)
+                ssh.connect()
+                hs = check_server_handshakes(
+                    ssh,
+                    protocols,
+                    stale_hours=float(cfg.get('handshake_stale_hours', 6) or 6),
+                )
+                hs_level = hs.get('level') or 'ok'
+                reasons.extend(hs.get('reasons') or [])
+            except Exception as e:
+                reasons.append(f'handshake_error:{e}')
+            finally:
+                try:
+                    if ssh:
+                        ssh.disconnect()
+                except Exception:
+                    pass
+
+    level = merge_levels(reg_level, hs_level)
+    return {
+        'name': name,
+        'host': host,
+        'ip': ip,
+        'level': level,
+        'reasons': reasons,
+    }
+
+
+def run_rkn_checks(cfg: dict) -> list:
+    """Refresh dump if needed and check every server. Blocking."""
+    data = load_data()
+    servers = data.get('servers') or []
+    index = None
+    if cfg.get('check_registry', True):
+        try:
+            index = ensure_dump_index(
+                cache_dir_for_data_file(DATA_FILE),
+                url=(cfg.get('dump_url') or default_rkn_monitor_settings()['dump_url']),
+                refresh_seconds=max(3600, int(cfg.get('dump_refresh_seconds', 14400) or 14400)),
+            )
+        except Exception as e:
+            logger.error('RKN dump unavailable: %s', e)
+            index = get_dump_index()
+
+    results = []
+    for s in servers:
+        if not s.get('host'):
+            continue
+        try:
+            results.append(_probe_server_rkn(s, cfg, index))
+        except Exception as e:
+            logger.warning('RKN probe failed for %s: %s', s.get('host'), e)
+            results.append({
+                'name': s.get('name') or s.get('host'),
+                'host': s.get('host'),
+                'ip': None,
+                'level': 'ok',
+                'reasons': [f'probe_error:{e}'],
+            })
+    return results
+
+
+def _apply_rkn_probe(results: list, threshold: int, notify_clear: bool):
+    """Update RKN state and notify admins on level transitions."""
+    global _rkn_primed, _rkn_last_results
+    _rkn_last_results = list(results or [])
+    seen = set()
+    for row in results or []:
+        key = (row.get('host') or '').strip()
+        if not key:
+            continue
+        seen.add(key)
+        level = row.get('level') or 'ok'
+        st = _rkn_state.setdefault(key, {
+            'level': 'ok', 'fails': 0, 'alerted_level': None,
+        })
+        name = row.get('name') or key
+        host = row.get('host') or key
+        ip = row.get('ip') or host
+        detail = ', '.join(row.get('reasons') or []) or None
+
+        if not _rkn_primed:
+            st['level'] = level
+            st['fails'] = 0
+            st['alerted_level'] = level if level != 'ok' else None
+            continue
+
+        if level == 'ok':
+            st['fails'] = 0
+            prev_alerted = st.get('alerted_level')
+            st['level'] = 'ok'
+            if prev_alerted:
+                st['alerted_level'] = None
+                if notify_clear:
+                    _notify_bot(lambda n=name, h=host, i=ip, pl=prev_alerted: tg_bot.notify_rkn_alert(
+                        bot_services(), 'clear', n, h, ip=i, level=pl,
+                    ))
+            continue
+
+        # Problem level (at_risk / blocked): escalate immediately if worse than
+        # already alerted; otherwise count consecutive observations.
+        st['level'] = level
+        prev_alerted = st.get('alerted_level')
+        order = {'ok': 0, 'at_risk': 1, 'blocked': 2}
+        if prev_alerted and order.get(level, 0) > order.get(prev_alerted, 0):
+            st['fails'] = threshold
+        else:
+            st['fails'] = int(st.get('fails') or 0) + 1
+
+        if st['fails'] >= threshold and prev_alerted != level:
+            st['alerted_level'] = level
+            kind = 'blocked' if level == 'blocked' else 'at_risk'
+            _notify_bot(lambda n=name, h=host, i=ip, k=kind, d=detail: tg_bot.notify_rkn_alert(
+                bot_services(), k, n, h, ip=i, level=k, detail=d,
+            ))
+
+    for stale in list(_rkn_state.keys()):
+        if stale not in seen:
+            _rkn_state.pop(stale, None)
+
+    if not _rkn_primed and results is not None:
+        _rkn_primed = True
+
+
+async def periodic_rkn_monitor():
+    """Poll RKN dump + AWG handshake symptoms; notify admins on status changes."""
+    await asyncio.sleep(90)
+    while True:
+        interval = 900
+        try:
+            data = load_data()
+            cfg = {
+                **default_rkn_monitor_settings(),
+                **(data.get('settings', {}).get('rkn_monitor') or {}),
+            }
+            interval = max(300, int(cfg.get('interval_seconds', 900) or 900))
+            threshold = max(1, int(cfg.get('fail_threshold', 2) or 2))
+            notify_clear = bool(cfg.get('notify_clear', True))
+            if cfg.get('enabled', True):
+                results = await asyncio.to_thread(run_rkn_checks, cfg)
+                _apply_rkn_probe(results, threshold, notify_clear)
+        except Exception as e:
+            logger.error('periodic_rkn_monitor loop error: %s', e)
+        await asyncio.sleep(interval)
+
+
 # ======================== Startup ========================
 
 @app.on_event("startup")
@@ -1598,6 +1795,7 @@ async def startup():
     asyncio.create_task(periodic_background_tasks())
     asyncio.create_task(periodic_s3_backup())
     asyncio.create_task(periodic_server_monitor())
+    asyncio.create_task(periodic_rkn_monitor())
 
     # Start Telegram bot if enabled
     tg_cfg = data.get('settings', {}).get('telegram', {})
@@ -3721,6 +3919,85 @@ async def api_set_monitor_settings(request: Request, req: MonitorSettingsRequest
         data.setdefault('settings', {})['monitor'] = payload
         save_data(data)
     return {'status': 'success', 'monitor': payload}
+
+
+def _public_rkn_monitor_settings(cfg: dict) -> dict:
+    base = default_rkn_monitor_settings()
+    merged = {**base, **(cfg or {})}
+    return {
+        'enabled': bool(merged.get('enabled', True)),
+        'interval_seconds': int(merged.get('interval_seconds', 900) or 900),
+        'dump_refresh_seconds': int(merged.get('dump_refresh_seconds', 14400) or 14400),
+        'fail_threshold': int(merged.get('fail_threshold', 2) or 2),
+        'check_registry': bool(merged.get('check_registry', True)),
+        'check_handshake': bool(merged.get('check_handshake', True)),
+        'handshake_stale_hours': int(merged.get('handshake_stale_hours', 6) or 6),
+        'notify_clear': bool(merged.get('notify_clear', True)),
+        'dump_url': (merged.get('dump_url') or base['dump_url']),
+    }
+
+
+@app.get('/api/rkn_monitor/settings', tags=["Settings"])
+async def api_get_rkn_monitor_settings(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    cfg = _public_rkn_monitor_settings(data.get('settings', {}).get('rkn_monitor') or {})
+    idx = get_dump_index()
+    return {
+        'rkn_monitor': cfg,
+        'status': {
+            'dump_ready': bool(idx and idx.ready),
+            'dump_loaded_at': idx.loaded_at if idx else None,
+            'dump_exact': len(idx.exact) if idx else 0,
+            'dump_networks': len(idx.networks) if idx else 0,
+            'last_results': _rkn_last_results,
+        },
+    }
+
+
+@app.post('/api/rkn_monitor/settings', tags=["Settings"])
+async def api_set_rkn_monitor_settings(request: Request, req: RknMonitorSettingsRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    base = default_rkn_monitor_settings()
+    dump_url = (req.dump_url or '').strip() or base['dump_url']
+    payload = {
+        'enabled': bool(req.enabled),
+        'interval_seconds': max(300, min(86400, int(req.interval_seconds or 900))),
+        'dump_refresh_seconds': max(3600, min(86400 * 7, int(req.dump_refresh_seconds or 14400))),
+        'fail_threshold': max(1, min(20, int(req.fail_threshold or 2))),
+        'check_registry': bool(req.check_registry),
+        'check_handshake': bool(req.check_handshake),
+        'handshake_stale_hours': max(1, min(168, int(req.handshake_stale_hours or 6))),
+        'notify_clear': bool(req.notify_clear),
+        'dump_url': dump_url,
+    }
+    async with DATA_LOCK:
+        data = load_data()
+        data.setdefault('settings', {})['rkn_monitor'] = payload
+        save_data(data)
+    return {'status': 'success', 'rkn_monitor': payload}
+
+
+@app.post('/api/rkn_monitor/check_now', tags=["Settings"])
+async def api_rkn_monitor_check_now(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    cfg = {
+        **default_rkn_monitor_settings(),
+        **(data.get('settings', {}).get('rkn_monitor') or {}),
+    }
+    try:
+        results = await asyncio.to_thread(run_rkn_checks, cfg)
+        # Manual check updates last_results and applies transitions (after prime).
+        threshold = max(1, int(cfg.get('fail_threshold', 2) or 2))
+        _apply_rkn_probe(results, threshold, bool(cfg.get('notify_clear', True)))
+        return {'status': 'success', 'results': results}
+    except Exception as e:
+        logger.exception('manual RKN check failed')
+        return JSONResponse({'error': str(e)}, status_code=500)
 
 
 @app.get('/api/settings/backup/s3', tags=["Settings"])

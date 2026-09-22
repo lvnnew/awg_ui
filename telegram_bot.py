@@ -325,6 +325,45 @@ async def notify_server_availability(
         logger.warning(f"notify_server_availability failed: {e}")
 
 
+async def notify_rkn_alert(
+    services: dict,
+    kind: str,
+    server_name: str,
+    host: str,
+    ip: str = None,
+    level: str = None,
+    detail=None,
+) -> None:
+    """Admin-only alert about RKN dump hits / DPI handshake symptoms."""
+    name = html.escape(server_name or host or "сервер")
+    addr = html.escape(ip or host or "")
+    reasons = ""
+    if detail:
+        reasons = "\n" + html.escape(str(detail))
+    if kind == "blocked":
+        text = (
+            f"⛔ <b>IP в реестре РКН:</b> {name}\n"
+            f"<code>{addr}</code>{reasons}"
+        )
+    elif kind == "at_risk":
+        text = (
+            f"⚠️ <b>Риск блокировки РКН/DPI:</b> {name}\n"
+            f"<code>{addr}</code>{reasons}"
+        )
+    elif kind == "clear":
+        prev = html.escape(level or "problem")
+        text = (
+            f"✅ <b>РКН-статус снят ({prev}):</b> {name}\n"
+            f"<code>{addr}</code>"
+        )
+    else:
+        return
+    try:
+        await broadcast_message(services, text, audience="admins", parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"notify_rkn_alert failed: {e}")
+
+
 def _proto_label(proto: str) -> str:
     return _PROTO_LABELS.get(proto, proto.upper())
 
