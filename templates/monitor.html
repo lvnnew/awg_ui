@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+
+{% block title_extra %} — {{ _('nav_monitor') }}{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>{{ _('nav_monitor') }}</h1>
+        <p class="page-desc">{{ _('monitor_hub_desc') }}</p>
+    </div>
+    <div class="page-header-actions">
+        <a href="/settings?section=monitoring" class="btn btn-secondary btn-sm">{{ _('monitor_hub_settings') }}</a>
+        <button type="button" class="btn btn-primary btn-sm" id="rknCheckNowBtn" onclick="rknCheckNow()">
+            <span id="rknCheckNowText">{{ _('rkn_monitor_check_now') }}</span>
+            <span id="rknCheckNowSpin" class="hidden">…</span>
+        </button>
+    </div>
+</div>
+
+<div class="monitor-grid">
+    <div class="card">
+        <h3 class="card-title">{{ _('monitor_hub_ssh') }}</h3>
+        <p class="form-hint">{{ _('monitor_hint') }}</p>
+        <div id="sshStatusList" class="form-hint" style="margin-top: var(--space-md);">{{ _('loading') }}</div>
+    </div>
+    <div class="card">
+        <h3 class="card-title">{{ _('monitor_hub_rkn') }}</h3>
+        <p class="form-hint" id="rknStatusHint">{{ _('loading') }}</p>
+        <div id="rknDumpMeta" class="form-hint" style="margin-top: var(--space-sm);"></div>
+    </div>
+</div>
+
+<div class="card" style="margin-top: var(--space-lg);">
+    <h3 class="card-title">{{ _('monitor_hub_problems') }}</h3>
+    <div id="rknProblemsBox" style="margin-top: var(--space-md);">
+        <div class="empty-state" style="padding: var(--space-lg);">
+            <div class="empty-title" id="problemsEmpty">{{ _('monitor_hub_no_problems') }}</div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const I18N_MONITOR = {
+  dumpOk: {{ _('monitor_hub_dump_ok')|tojson }},
+  dumpPending: {{ _('monitor_hub_dump_pending')|tojson }},
+  noProblems: {{ _('monitor_hub_no_problems')|tojson }},
+};
+
+async function refreshMonitorHub() {
+    try {
+        const status = await apiCall('/api/servers/status');
+        const sshBox = document.getElementById('sshStatusList');
+        if (Array.isArray(status) && sshBox) {
+            sshBox.innerHTML = status.map(s => {
+                const cls = s.online ? 'ok' : 'danger';
+                const label = s.online ? ('online' + (s.ping_ms != null ? ' · ' + s.ping_ms + ' ms' : '')) : 'offline';
+                return '<div style="display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid var(--border-color);">'
+                    + '<span>' + (s.name || s.host) + '</span>'
+                    + '<span class="stat-badge ' + cls + '"><span class="dot"></span>' + label + '</span></div>';
+            }).join('') || '—';
+        }
+    } catch (e) {
+        const sshBox = document.getElementById('sshStatusList');
+        if (sshBox) sshBox.textContent = e.message;
+    }
+
+    try {
+        const res = await fetch('/api/rkn_monitor/settings');
+        const data = await res.json();
+        const st = data.status || {};
+        const hint = document.getElementById('rknStatusHint');
+        const meta = document.getElementById('rknDumpMeta');
+        const box = document.getElementById('rknProblemsBox');
+        if (hint) hint.textContent = st.dump_ready ? I18N_MONITOR.dumpOk : I18N_MONITOR.dumpPending;
+        if (meta) {
+            meta.textContent = st.dump_ready
+                ? ('IP: ' + (st.dump_watched || 0)
+                    + (st.dump_tokens ? (', tokens≈' + st.dump_tokens) : '')
+                    + ', in dump: ' + (st.dump_exact || 0))
+                : '';
+        }
+        const bad = (st.last_results || []).filter(r => r.level && r.level !== 'ok');
+        if (box) {
+            if (!bad.length) {
+                box.innerHTML = '<div class="empty-state" style="padding: var(--space-lg);"><div class="empty-title">'
+                    + I18N_MONITOR.noProblems + '</div></div>';
+            } else {
+                box.innerHTML = bad.map(r => {
+                    const lvl = r.level === 'blocked' ? 'danger' : 'warn';
+                    return '<div class="monitor-problem">'
+                        + '<strong>' + (r.name || r.host || '?')
+                        + ' <span class="stat-badge ' + lvl + '"><span class="dot"></span>' + r.level + '</span></strong>'
+                        + '<div class="meta">' + (r.ip || r.host || '') + '</div>'
+                        + '<div class="summary"></div></div>';
+                }).join('');
+                Array.from(box.querySelectorAll('.monitor-problem')).forEach((el, i) => {
+                    const sum = bad[i].summary || ((bad[i].reasons || []).join('; ')) || bad[i].level;
+                    el.querySelector('.summary').textContent = sum;
+                });
+            }
+        }
+    } catch (e) { /* ignore */ }
+}
+
+async function rknCheckNow() {
+    const btn = document.getElementById('rknCheckNowBtn');
+    const txt = document.getElementById('rknCheckNowText');
+    const spin = document.getElementById('rknCheckNowSpin');
+    if (btn) btn.disabled = true;
+    if (txt) txt.classList.add('hidden');
+    if (spin) spin.classList.remove('hidden');
+    try {
+        const res = await fetch('/api/rkn_monitor/check_now', { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+            const bad = (data.results || []).filter(r => r.level && r.level !== 'ok');
+            if (!bad.length) showToast('OK · ' + (data.results || []).length, 'success');
+            else showToast(bad.map(r => (r.name || r.host) + ': ' + (r.summary || r.level)).join(' | '), 'error');
+            await refreshMonitorHub();
+        } else showToast(data.error || 'Error', 'error');
+    } catch (err) {
+        showToast(err.message, 'error');
+    } finally {
+        if (btn) btn.disabled = false;
+        if (txt) txt.classList.remove('hidden');
+        if (spin) spin.classList.add('hidden');
+    }
+}
+
+document.addEventListener('DOMContentLoaded', refreshMonitorHub);
+</script>
+{% endblock %}

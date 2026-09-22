@@ -4,12 +4,13 @@
 
 {% block content %}
 <section>
-    <div class="flex items-center justify-between" style="margin-bottom: var(--space-lg); gap: var(--space-md); flex-wrap: wrap;">
-        <h1 class="section-title" style="margin-bottom:0;">
-            <span class="icon">📋</span>
-            {{ _('audit_title') }}
-        </h1>
-        <a href="/users" class="btn btn-secondary btn-sm">← {{ _('nav_users') }}</a>
+    <div class="page-header">
+        <div>
+            <h1>{{ _('audit_title') }}</h1>
+        </div>
+        <div class="page-header-actions">
+            <a href="/users" class="btn btn-secondary btn-sm">← {{ _('nav_users') }}</a>
+        </div>
     </div>
 
     <div id="auditDisabledBanner" class="hidden" style="margin-bottom: var(--space-md); padding: var(--space-md); border-radius: var(--radius-md); background: var(--bg-primary); border: 1px solid var(--border-color); color: var(--text-muted);">

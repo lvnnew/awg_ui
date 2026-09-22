@@ -2,14 +2,16 @@
 
 {% block content %}
 <section>
-    <div class="flex items-center justify-between" style="margin-bottom: var(--space-lg);">
-        <h1 class="section-title" style="margin-bottom:0;">
-            <span class="icon">🖥</span>
-            {{ _('nav_servers') }}
-        </h1>
-        <button class="btn btn-primary" onclick="openModal('addServerModal')">
-            <span>＋</span> {{ _('add_server') }}
-        </button>
+    <div class="page-header">
+        <div>
+            <h1>{{ _('nav_servers') }}</h1>
+            <p class="page-desc">{{ _('servers_page_desc') }}</p>
+        </div>
+        <div class="page-header-actions">
+            <button class="btn btn-primary" onclick="openModal('addServerModal')">
+                <span>＋</span> {{ _('add_server') }}
+            </button>
+        </div>
     </div>
 
     {% if servers %}
@@ -20,7 +22,7 @@
             data-username="{{ server.username }}" data-auth="{{ 'key' if server.private_key else 'password' }}"
             draggable="true">
             <div class="server-meta">
-                <div class="server-icon">🖥</div>
+                <div class="server-icon">S</div>
                 <div style="min-width: 0; flex: 1;">
                     <div class="server-name">
                         <span class="ping-dot ping-pending" id="ping-{{ loop.index0 }}"
@@ -29,6 +31,7 @@
                         <span class="ping-ms text-muted" id="ping-ms-{{ loop.index0 }}"></span>
                     </div>
                     <div class="server-host">{{ server.host }}:{{ server.ssh_port }}</div>
+                    <div class="server-status-badges" id="rkn-badge-{{ loop.index0 }}" style="margin-top:6px;"></div>
                 </div>
             </div>
 
@@ -56,29 +59,22 @@
                     {{ _('manage') }}
                 </a>
                 <button class="btn btn-secondary btn-sm btn-icon" onclick="openEditServer(this)"
-                    title="{{ _('edit') }}">
-                    ✏️
-                </button>
+                    title="{{ _('edit') }}">✎</button>
                 <button class="btn btn-danger btn-sm btn-icon" onclick="deleteServer({{ loop.index0 }})"
-                    title="{{ _('delete') }}">
-                    🗑
-                </button>
+                    title="{{ _('delete') }}">✕</button>
             </div>
         </div>
         {% endfor %}
     </div>
     {% else %}
     <div class="empty-state">
-        <div class="empty-icon">🛡</div>
         <div class="empty-title">{{ _('no_servers') }}</div>
-        <div class="empty-desc">
-            {{ _('add_server_desc') }}
-        </div>
+        <div class="empty-desc">{{ _('add_server_desc') }}</div>
         <button class="btn btn-primary" onclick="openModal('addServerModal')">
             <span>＋</span> {{ _('add_server') }}
         </button>
     </div>
-    {% endif %}
+{% endif %}
 </section>
 
 <!-- ===== Edit Server Modal ===== -->
@@ -445,9 +441,30 @@
         });
     }
 
+    async function loadFleetRknBadges() {
+        try {
+            const rows = await apiCall('/api/servers/status');
+            if (!Array.isArray(rows)) return;
+            rows.forEach((row, idx) => {
+                const el = document.getElementById('rkn-badge-' + idx);
+                if (!el) return;
+                const lvl = row.rkn_level || 'ok';
+                if (lvl === 'ok') {
+                    el.innerHTML = '';
+                    return;
+                }
+                const cls = lvl === 'blocked' ? 'danger' : 'warn';
+                const title = row.rkn_summary || lvl;
+                el.innerHTML = '<span class="stat-badge ' + cls + '" title="' + String(title).replace(/"/g, '&quot;') + '">'
+                    + '<span class="dot"></span>RKN: ' + lvl + '</span>';
+            });
+        } catch (e) { /* non-critical */ }
+    }
+
     document.addEventListener('DOMContentLoaded', () => {
         startAllPings();
         setupDragAndDrop();
+        loadFleetRknBadges();
     });
 </script>
 {% endblock %}

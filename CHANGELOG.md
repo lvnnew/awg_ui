@@ -8,6 +8,9 @@
 ## [Unreleased]
 
 ### Added
+- **UI shell**: боковая навигация, страница `/monitor`, Settings по секциям,
+  бейджи РКН на списке серверов. Без SPA — Jinja + `shell.css` / `panel.js`.
+
 - **AmneziaWG 3.1** как отдельный протокол `awg3` (контейнер `amnezia-awg3`,
   образ `amneziavpn/amneziawg-go:3.1.20260828`): Header Protection,
   RandomTrailers, ContentPadding, таймеры. Без миграции существующих `awg`/`awg2`.

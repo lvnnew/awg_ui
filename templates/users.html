@@ -4,24 +4,23 @@
 
 {% block content %}
 <section>
-    <div class="flex items-center justify-between"
-        style="margin-bottom: var(--space-lg); gap: var(--space-md); flex-wrap: wrap;">
-        <h1 class="section-title" style="margin-bottom:0; flex-shrink: 0;">
-            <span class="icon">👥</span>
-            {{ _('users_title') }}
-        </h1>
-
-        <div style="flex: 1; min-width: 250px; max-width: 500px; position: relative;">
+    <div class="page-header">
+        <div>
+            <h1>{{ _('users_title') }}</h1>
+        </div>
+        <div class="page-header-actions" style="flex:1; justify-content:flex-end; min-width:250px;">
+            <div style="flex: 1; min-width: 200px; max-width: 400px; position: relative;">
             <input type="text" class="form-input" id="userSearch" placeholder="{{ _('search_placeholder') }}"
                 oninput="handleSearch(this.value)" style="padding-left: 40px;">
-            <span style="position: absolute; left: 14px; top: 50%; transform: translateY(-50%); opacity: 0.5;">🔍</span>
-        </div>
+            <span style="position: absolute; left: 14px; top: 50%; transform: translateY(-50%); opacity: 0.5;">⌕</span>
+            </div>
 
         {% if current_user.role == 'admin' %}
         <button class="btn btn-primary" onclick="openModal('addUserModal')" style="flex-shrink: 0;">
             <span>＋</span> {{ _('add_user') }}
         </button>
         {% endif %}
+        </div>
     </div>
 
     <div class="card" style="margin-bottom: var(--space-md); padding: var(--space-md);">

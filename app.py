@@ -2051,6 +2051,40 @@ async def audit_page(request: Request):
     return tpl(request, 'audit.html')
 
 
+@app.get('/monitor', response_class=HTMLResponse, tags=["System Templates"])
+async def monitor_page(request: Request):
+    cur = get_current_user(request)
+    if not cur or cur['role'] != 'admin':
+        return RedirectResponse(url='/login', status_code=302)
+    return tpl(request, 'monitor.html')
+
+
+@app.get('/api/servers/status', tags=["Servers"])
+async def api_servers_status(request: Request):
+    """SSH reachability snapshot for Monitor hub / fleet badges."""
+    cur = get_current_user(request)
+    if not cur or cur['role'] not in ('admin', 'support'):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    results = await asyncio.to_thread(get_servers_status)
+    # Attach last known RKN levels from in-memory state
+    rkn_by_host = {k: v for k, v in (_rkn_state or {}).items()}
+    for row in results:
+        host = (row.get('host') or '').strip()
+        st = rkn_by_host.get(host) or {}
+        row['rkn_level'] = st.get('level') or 'ok'
+        row['rkn_alerted'] = st.get('alerted_level')
+    # Prefer last_results summaries when available
+    by_host = { (r.get('host') or '').strip(): r for r in (_rkn_last_results or []) }
+    for row in results:
+        host = (row.get('host') or '').strip()
+        lr = by_host.get(host)
+        if lr:
+            row['rkn_level'] = lr.get('level') or row.get('rkn_level') or 'ok'
+            row['rkn_summary'] = lr.get('summary')
+            row['rkn_ip'] = lr.get('ip')
+    return results
+
+
 @app.get('/my', response_class=HTMLResponse, tags=["System Templates"])
 async def my_connections_page(request: Request):
     user = get_current_user(request)
