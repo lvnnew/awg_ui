@@ -103,6 +103,74 @@ def generate_awg_params(use_ranges=False):
     }
 
 
+def generate_awg3_params():
+    """Generate AmneziaWG 3.1 parameters (Header Protection + RandomTrailers).
+
+    Docs: with Header Protection keep H1–H4 at 1–4; S1–S4 must be >= 12;
+    with RandomTrailers prefer identical S1–S4. HeaderProtectionKey is a
+    32-byte key (same encoding as `awg genkey`).
+    """
+    import random
+    s = random.randint(12, 32)
+    jc = random.randint(4, 8)
+    jmin = random.randint(10, 20)
+    jmax = random.randint(jmin + 20, min(jmin + 60, 128))
+    pad_lo = random.randint(0, 8)
+    pad_hi = random.randint(max(pad_lo + 8, 16), 64)
+    return {
+        'junk_packet_count': str(jc),
+        'junk_packet_min_size': str(jmin),
+        'junk_packet_max_size': str(jmax),
+        'init_packet_junk_size': str(s),
+        'response_packet_junk_size': str(s),
+        'cookie_reply_packet_junk_size': str(s),
+        'transport_packet_junk_size': str(s),
+        # Compatibility values — custom headers disabled; type hidden by HPK
+        'init_packet_magic_header': '1',
+        'response_packet_magic_header': '2',
+        'underload_packet_magic_header': '3',
+        'transport_packet_magic_header': '4',
+        'header_protection_key': b64encode(secrets.token_bytes(32)).decode(),
+        'content_padding_addition': f'{pad_lo}-{pad_hi}',
+        'rekey_after_time': '120-180',
+        'rekey_timeout': '5-10',
+        'reject_after_time': '180-240',
+        'keepalive_timeout': '10-25',
+        'random_trailers': 'on',
+        'disable_cookies': 'off',
+    }
+
+
+# (internal param key, wire config key) for client/server obfuscation fields
+_AWG_OBFUSCATION_FIELDS = [
+    ('junk_packet_count', 'Jc'),
+    ('junk_packet_min_size', 'Jmin'),
+    ('junk_packet_max_size', 'Jmax'),
+    ('init_packet_junk_size', 'S1'),
+    ('response_packet_junk_size', 'S2'),
+    ('cookie_reply_packet_junk_size', 'S3'),
+    ('transport_packet_junk_size', 'S4'),
+    ('init_packet_magic_header', 'H1'),
+    ('response_packet_magic_header', 'H2'),
+    ('underload_packet_magic_header', 'H3'),
+    ('transport_packet_magic_header', 'H4'),
+    ('i1', 'I1'),
+    ('i2', 'I2'),
+    ('i3', 'I3'),
+    ('i4', 'I4'),
+    ('i5', 'I5'),
+    ('cps', 'CPS'),
+    ('header_protection_key', 'HeaderProtectionKey'),
+    ('content_padding_addition', 'ContentPaddingAddition'),
+    ('rekey_after_time', 'RekeyAfterTime'),
+    ('rekey_timeout', 'RekeyTimeout'),
+    ('reject_after_time', 'RejectAfterTime'),
+    ('keepalive_timeout', 'KeepaliveTimeout'),
+    ('random_trailers', 'RandomTrailers'),
+    ('disable_cookies', 'DisableCookies'),
+]
+
+
 class AWGManager:
     """Manages AmneziaWG protocol installation and client management."""
 
@@ -110,6 +178,7 @@ class AWGManager:
     AWG = 'awg'          # New AWG (awg-go based, uses awg/awg-quick)
     AWG_LEGACY = 'awg_legacy'  # Legacy AWG (uses wg/wg-quick)
     AWG2 = 'awg2'        # AmneziaWG 2.0 (separate container amnezia-awg2)
+    AWG3 = 'awg3'        # AmneziaWG 3.1 (Header Protection + RandomTrailers)
 
     def __init__(self, ssh_manager):
         self.ssh = ssh_manager
@@ -122,6 +191,8 @@ class AWGManager:
             return 'amnezia-awg-legacy'
         if protocol_type == self.AWG2:
             return 'amnezia-awg2'
+        if protocol_type == self.AWG3:
+            return 'amnezia-awg3'
         return 'amnezia-awg'
 
     # ------------------------------------------------------------------ #
@@ -138,8 +209,8 @@ class AWGManager:
         if protocol_type in self._layout_cache:
             return self._layout_cache[protocol_type]
 
-        # AWG2 uses awg-go; plain AWG defaults to wg0 (Amnezia app style).
-        if protocol_type == self.AWG2:
+        # AWG2/AWG3 use awg-go; plain AWG defaults to wg0 (Amnezia app style).
+        if protocol_type in (self.AWG2, self.AWG3):
             layout = {'config': 'awg0.conf', 'wg': 'awg', 'quick': 'awg-quick', 'iface': 'awg0'}
         else:
             layout = {'config': 'wg0.conf', 'wg': 'wg', 'quick': 'wg-quick', 'iface': 'wg0'}
@@ -188,6 +259,9 @@ class AWGManager:
 
     def _docker_image(self, protocol_type):
         """Get Docker image for protocol type."""
+        # AWG 3.1 — pin a known-good amneziawg-go tag (tools+engine same generation).
+        if protocol_type == self.AWG3:
+            return 'amneziavpn/amneziawg-go:3.1.20260828'
         # AWG 2.0 uses awg-go; plain AWG matches the Amnezia client app layout
         # (wg0.conf + wg binary) for broad client compatibility (iOS/macOS).
         if protocol_type == self.AWG2:
@@ -196,17 +270,35 @@ class AWGManager:
 
     def _server_subnet(self, protocol_type):
         """Server-side WireGuard interface address (CIDR)."""
-        if protocol_type == self.AWG2:
+        if protocol_type in (self.AWG2, self.AWG3):
             return AWG_DEFAULTS['subnet_ip']
         return AWG_DEFAULTS['subnet_address']
 
     def _skip_client_obfuscation_key(self, protocol_type, config_key):
         """Keys omitted from client configs on compatible AWG layouts."""
-        if protocol_type == self.AWG2:
+        if protocol_type in (self.AWG2, self.AWG3):
             return False
         if protocol_type in (self.AWG, self.AWG_LEGACY):
-            return config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS')
+            return config_key in (
+                'S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS',
+                'HeaderProtectionKey', 'ContentPaddingAddition',
+                'RekeyAfterTime', 'RekeyTimeout', 'RejectAfterTime',
+                'KeepaliveTimeout', 'RandomTrailers', 'DisableCookies',
+            )
         return False
+
+    def _append_obfuscation_lines(self, config_lines, awg_params, protocol_type):
+        """Append non-empty obfuscation keys to a client Interface section."""
+        for param_key, config_key in _AWG_OBFUSCATION_FIELDS:
+            val = awg_params.get(param_key)
+            if not val:
+                continue
+            if self._skip_client_obfuscation_key(protocol_type, config_key):
+                continue
+            # Skip explicit "off" for optional toggles to keep configs tidy
+            if config_key == 'DisableCookies' and str(val).lower() == 'off':
+                continue
+            config_lines.append(f"{config_key} = {val}")
 
     def _clients_table_path(self):
         """Path to the clients table file inside container."""
@@ -301,7 +393,10 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             port = AWG_DEFAULTS['port']
 
         if awg_params is None:
-            awg_params = generate_awg_params(use_ranges=(protocol_type == self.AWG2))
+            if protocol_type == self.AWG3:
+                awg_params = generate_awg3_params()
+            else:
+                awg_params = generate_awg_params(use_ranges=(protocol_type == self.AWG2))
 
         container_name = self._container_name(protocol_type)
         docker_image = self._docker_image(protocol_type)
@@ -390,6 +485,9 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         # Step 6: Configure container (generate server keys and config)
         results.append("Configuring AWG...")
         self._configure_container(protocol_type, port, awg_params)
+        if protocol_type == self.AWG3:
+            # Refresh params from live conf (HeaderProtectionKey etc.)
+            awg_params = self._get_awg_params_from_config(protocol_type)
         results.append("AWG configured")
 
         # Step 7: Upload and run start script
@@ -445,7 +543,60 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         subnet_cidr = AWG_DEFAULTS['subnet_cidr']
 
         # Build the server config generation script
-        if protocol_type == self.AWG2:
+        if protocol_type == self.AWG3:
+            hpk = (awg_params.get('header_protection_key') or '').replace("'", "")
+            cpad = awg_params.get('content_padding_addition', '0-32')
+            rekey_after = awg_params.get('rekey_after_time', '120-180')
+            rekey_to = awg_params.get('rekey_timeout', '5-10')
+            reject_after = awg_params.get('reject_after_time', '180-240')
+            keepalive = awg_params.get('keepalive_timeout', '10-25')
+            trailers = awg_params.get('random_trailers', 'on')
+            no_cookies = awg_params.get('disable_cookies', 'off')
+            config_script = f"""
+mkdir -p /opt/amnezia/awg
+cd /opt/amnezia/awg
+WIREGUARD_SERVER_PRIVATE_KEY=$({wg_bin} genkey)
+echo $WIREGUARD_SERVER_PRIVATE_KEY > /opt/amnezia/awg/wireguard_server_private_key.key
+
+WIREGUARD_SERVER_PUBLIC_KEY=$(echo $WIREGUARD_SERVER_PRIVATE_KEY | {wg_bin} pubkey)
+echo $WIREGUARD_SERVER_PUBLIC_KEY > /opt/amnezia/awg/wireguard_server_public_key.key
+
+WIREGUARD_PSK=$({wg_bin} genpsk)
+echo $WIREGUARD_PSK > /opt/amnezia/awg/wireguard_psk.key
+
+HEADER_PROTECTION_KEY={hpk}
+if [ -z "$HEADER_PROTECTION_KEY" ]; then
+  HEADER_PROTECTION_KEY=$({wg_bin} genkey)
+fi
+echo $HEADER_PROTECTION_KEY > /opt/amnezia/awg/header_protection.key
+
+cat > {config_path} <<EOF
+[Interface]
+PrivateKey = $WIREGUARD_SERVER_PRIVATE_KEY
+Address = {subnet_ip}/{subnet_cidr}
+ListenPort = {port}
+Jc = {awg_params['junk_packet_count']}
+Jmin = {awg_params['junk_packet_min_size']}
+Jmax = {awg_params['junk_packet_max_size']}
+S1 = {awg_params['init_packet_junk_size']}
+S2 = {awg_params['response_packet_junk_size']}
+S3 = {awg_params['cookie_reply_packet_junk_size']}
+S4 = {awg_params['transport_packet_junk_size']}
+H1 = {awg_params['init_packet_magic_header']}
+H2 = {awg_params['response_packet_magic_header']}
+H3 = {awg_params['underload_packet_magic_header']}
+H4 = {awg_params['transport_packet_magic_header']}
+HeaderProtectionKey = $HEADER_PROTECTION_KEY
+ContentPaddingAddition = {cpad}
+RekeyAfterTime = {rekey_after}
+RekeyTimeout = {rekey_to}
+RejectAfterTime = {reject_after}
+KeepaliveTimeout = {keepalive}
+RandomTrailers = {trailers}
+DisableCookies = {no_cookies}
+EOF
+"""
+        elif protocol_type == self.AWG2:
             config_script = f"""
 mkdir -p /opt/amnezia/awg
 cd /opt/amnezia/awg
@@ -687,6 +838,14 @@ tail -f /dev/null
             'I4': 'i4',
             'I5': 'i5',
             'CPS': 'cps',
+            'HeaderProtectionKey': 'header_protection_key',
+            'ContentPaddingAddition': 'content_padding_addition',
+            'RekeyAfterTime': 'rekey_after_time',
+            'RekeyTimeout': 'rekey_timeout',
+            'RejectAfterTime': 'reject_after_time',
+            'KeepaliveTimeout': 'keepalive_timeout',
+            'RandomTrailers': 'random_trailers',
+            'DisableCookies': 'disable_cookies',
         }
 
         for line in config.split('\n'):
@@ -955,32 +1114,7 @@ AllowedIPs = {client_ip}/32
         ]
 
         # Conditional obfuscation fields
-        mapping = [
-            ('junk_packet_count', 'Jc'),
-            ('junk_packet_min_size', 'Jmin'),
-            ('junk_packet_max_size', 'Jmax'),
-            ('init_packet_junk_size', 'S1'),
-            ('response_packet_junk_size', 'S2'),
-            ('cookie_reply_packet_junk_size', 'S3'),
-            ('transport_packet_junk_size', 'S4'),
-            ('init_packet_magic_header', 'H1'),
-            ('response_packet_magic_header', 'H2'),
-            ('underload_packet_magic_header', 'H3'),
-            ('transport_packet_magic_header', 'H4'),
-            ('i1', 'I1'),
-            ('i2', 'I2'),
-            ('i3', 'I3'),
-            ('i4', 'I4'),
-            ('i5', 'I5'),
-            ('cps', 'CPS')
-        ]
-
-        for param_key, config_key in mapping:
-            val = awg_params.get(param_key)
-            if val:
-                if self._skip_client_obfuscation_key(protocol_type, config_key):
-                    continue
-                config_lines.append(f"{config_key} = {val}")
+        self._append_obfuscation_lines(config_lines, awg_params, protocol_type)
 
         client_config = "[Interface]\n" + "\n".join(config_lines) + f"""
 
@@ -1046,32 +1180,7 @@ PersistentKeepalive = 25
         ]
 
         # Conditional obfuscation fields
-        mapping = [
-            ('junk_packet_count', 'Jc'),
-            ('junk_packet_min_size', 'Jmin'),
-            ('junk_packet_max_size', 'Jmax'),
-            ('init_packet_junk_size', 'S1'),
-            ('response_packet_junk_size', 'S2'),
-            ('cookie_reply_packet_junk_size', 'S3'),
-            ('transport_packet_junk_size', 'S4'),
-            ('init_packet_magic_header', 'H1'),
-            ('response_packet_magic_header', 'H2'),
-            ('underload_packet_magic_header', 'H3'),
-            ('transport_packet_magic_header', 'H4'),
-            ('i1', 'I1'),
-            ('i2', 'I2'),
-            ('i3', 'I3'),
-            ('i4', 'I4'),
-            ('i5', 'I5'),
-            ('cps', 'CPS')
-        ]
-
-        for param_key, config_key in mapping:
-            val = awg_params.get(param_key)
-            if val:
-                if self._skip_client_obfuscation_key(protocol_type, config_key):
-                    continue
-                config_lines.append(f"{config_key} = {val}")
+        self._append_obfuscation_lines(config_lines, awg_params, protocol_type)
 
         config = "[Interface]\n" + "\n".join(config_lines) + f"""
 

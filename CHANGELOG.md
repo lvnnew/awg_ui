@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+### Added
+- **AmneziaWG 3.1** как отдельный протокол `awg3` (контейнер `amnezia-awg3`,
+  образ `amneziavpn/amneziawg-go:3.1.20260828`): Header Protection,
+  RandomTrailers, ContentPadding, таймеры. Без миграции существующих `awg`/`awg2`.
+  Клиентам нужен AmneziaVPN ≥ 5.0.1.5.
+
 ## [2026-09-20] — Telemt: лимит docker-логов
 
 ### Changed

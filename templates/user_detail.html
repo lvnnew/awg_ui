@@ -70,7 +70,7 @@
                 return;
             }
             list.innerHTML = data.connections.map(c => {
-                const protoLabel = c.protocol === 'awg' ? 'AmneziaWG' : (c.protocol === 'awg2' ? 'AmneziaWG 2.0' : (c.protocol === 'awg_legacy' ? 'AWG Legacy' : (c.protocol === 'xray' ? 'Xray' : c.protocol.toUpperCase())));
+                const protoLabel = c.protocol === 'awg' ? 'AmneziaWG' : (c.protocol === 'awg3' ? 'AmneziaWG 3.1' : (c.protocol === 'awg2' ? 'AmneziaWG 2.0' : (c.protocol === 'awg_legacy' ? 'AWG Legacy' : (c.protocol === 'xray' ? 'Xray' : c.protocol.toUpperCase()))));
                 let meta = `<span>🖥 ${c.server_name || ''}</span><span>${protoLabel}</span>`;
                 if (c.created_at) meta += `<span>📅 ${formatUserDate(c.created_at)}</span>`;
                 if (c.live_enabled === false) meta += `<span class="badge badge-danger" style="font-size:0.65rem;">${_('conn_status_offline')}</span>`;

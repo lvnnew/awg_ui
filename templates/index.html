@@ -38,8 +38,8 @@
                 {% if proto_val.get('installed') %}
                 <span class="badge badge-success">
                     <span class="badge-dot"></span>
-                    {{ 'AWG' if proto_key == 'awg' else ('AWG-Legacy' if proto_key == 'awg_legacy' else ('Xray' if
-                    proto_key == 'xray' else proto_key | upper)) }}
+                    {{ 'AWG' if proto_key == 'awg' else ('AWG 3.1' if proto_key == 'awg3' else ('AWG 2.0' if proto_key == 'awg2' else ('AWG-Legacy' if proto_key == 'awg_legacy' else ('Xray' if
+                    proto_key == 'xray' else proto_key | upper)))) }}
                 </span>
                 {% endif %}
                 {% endfor %}

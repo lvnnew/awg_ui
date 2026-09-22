@@ -609,7 +609,7 @@
             if (info.installed) {
                 const opt = document.createElement('option');
                 opt.value = key;
-                opt.textContent = key === 'awg' ? 'AmneziaWG' : (key === 'awg2' ? 'AmneziaWG 2.0' : (key === 'awg_legacy' ? 'AWG Legacy' : (key === 'xray' ? 'Xray' : key.toUpperCase())));
+                opt.textContent = key === 'awg' ? 'AmneziaWG' : (key === 'awg3' ? 'AmneziaWG 3.1' : (key === 'awg2' ? 'AmneziaWG 2.0' : (key === 'awg_legacy' ? 'AWG Legacy' : (key === 'xray' ? 'Xray' : key.toUpperCase()))));
                 select.appendChild(opt);
                 count++;
             }
@@ -874,7 +874,7 @@
             }
             listEl.innerHTML = '';
             data.connections.forEach(c => {
-                const protoLabel = c.protocol === 'awg' ? 'AmneziaWG' : (c.protocol === 'awg2' ? 'AmneziaWG 2.0' : (c.protocol === 'awg_legacy' ? 'AWG Legacy' : (c.protocol === 'xray' ? 'Xray' : c.protocol.toUpperCase())));
+                const protoLabel = c.protocol === 'awg' ? 'AmneziaWG' : (c.protocol === 'awg3' ? 'AmneziaWG 3.1' : (c.protocol === 'awg2' ? 'AmneziaWG 2.0' : (c.protocol === 'awg_legacy' ? 'AWG Legacy' : (c.protocol === 'xray' ? 'Xray' : c.protocol.toUpperCase()))));
                 let meta = `<span>🖥 ${c.server_name || ''}</span><span>${protoLabel}</span>`;
                 if (c.created_at) meta += `<span>📅 ${_('conn_created')}: ${formatUserDate(c.created_at)}</span>`;
                 if (c.live_enabled === false) meta += `<span class="badge badge-danger" style="font-size:0.65rem;">${_('conn_status_offline')}</span>`;

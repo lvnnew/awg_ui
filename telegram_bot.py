@@ -42,6 +42,7 @@ _NON_VPN_PROTOCOLS = {"dns", "adguard"}
 # Pretty labels for protocol keys.
 _PROTO_LABELS = {
     "awg": "AmneziaWG",
+    "awg3": "AmneziaWG 3.1",
     "awg2": "AmneziaWG 2",
     "awg_legacy": "AmneziaWG (legacy)",
     "xray": "XRay / VLESS",
@@ -411,6 +412,8 @@ _PROTO_HELP = {
     "awg": "<b>AmneziaWG</b> — основной. Маскируется под обычный трафик, обходит "
            "блокировки, работает на всех устройствах (iPhone/Mac/Android/Windows). "
            "Нужен клиент AmneziaWG или AmneziaVPN.",
+    "awg3": "<b>AmneziaWG 3.1</b> — новый протокол (Header Protection). Нужен "
+            "<b>AmneziaVPN ≥ 5.0.1.5</b>; старые клиенты не подключатся.",
     "xray": "<b>XRay / VLESS</b> — запасной, если AmneziaWG не подключается в жёсткой сети.",
     "telemt": "<b>Telemt</b> — прокси только для Telegram (не VPN). Разблокирует сам "
               "мессенджер: нажми «Применить».",
@@ -421,13 +424,16 @@ _PROTO_HELP = {
 
 def _available_protocols(load_data_fn: Callable) -> list:
     """Canonical protocol groups actually installed across the fleet, in
-    _PROTO_HELP display order. AWG variants collapse into one 'awg' entry."""
+    _PROTO_HELP display order. Classic AWG variants collapse into 'awg';
+    AWG 3.1 is shown separately when present."""
     present = set()
     try:
         for srv in load_data_fn().get("servers", []):
             for p in (srv.get("protocols") or {}):
                 if p in ("awg", "awg2", "awg_legacy"):
                     present.add("awg")
+                elif p == "awg3":
+                    present.add("awg3")
                 elif p in _PROTO_HELP:
                     present.add(p)
     except Exception as e:
@@ -872,17 +878,30 @@ async def _send_config(api: TelegramAPI, chat_id: int, name: str, server: dict, 
             await api.send_message(chat_id, f"<b>📄 Конфигурация (часть {i}/{len(chunks)}):</b>\n<pre>{chunk}</pre>")
 
     filename = f"{name.replace(' ', '_')}.conf"
-    await api.send_document(
-        chat_id, filename=filename, content=config.encode("utf-8"),
-        caption=f"📁 {name} — Оригинальный формат AmneziaWG",
-    )
-    await api.send_message(
-        chat_id,
-        "📲 <b>Как подключить:</b>\n"
-        "1. Установи приложение <b>AmneziaVPN</b> или <b>AmneziaWG</b>.\n"
-        "2. Импортируй этот <b>.conf</b>-файл (или скопируй текст конфигурации выше).\n\n"
-        "ℹ️ Это «Оригинальный формат AmneziaWG» — он корректно работает на iPhone, Mac, Android и Windows.",
-    )
+    if proto == "awg3":
+        await api.send_document(
+            chat_id, filename=filename, content=config.encode("utf-8"),
+            caption=f"📁 {name} — AmneziaWG 3.1",
+        )
+        await api.send_message(
+            chat_id,
+            "📲 <b>Как подключить:</b>\n"
+            "1. Нужен <b>AmneziaVPN ≥ 5.0.1.5</b> (старые клиенты 3.1 не поймут).\n"
+            "2. Импортируй этот <b>.conf</b>-файл (или скопируй текст конфигурации выше).\n\n"
+            "ℹ️ Формат AmneziaWG 3.1: Header Protection + RandomTrailers.",
+        )
+    else:
+        await api.send_document(
+            chat_id, filename=filename, content=config.encode("utf-8"),
+            caption=f"📁 {name} — Оригинальный формат AmneziaWG",
+        )
+        await api.send_message(
+            chat_id,
+            "📲 <b>Как подключить:</b>\n"
+            "1. Установи приложение <b>AmneziaVPN</b> или <b>AmneziaWG</b>.\n"
+            "2. Импортируй этот <b>.conf</b>-файл (или скопируй текст конфигурации выше).\n\n"
+            "ℹ️ Это «Оригинальный формат AmneziaWG» — он корректно работает на iPhone, Mac, Android и Windows.",
+        )
 
 
 # ----------------------------------------------------------------------- #

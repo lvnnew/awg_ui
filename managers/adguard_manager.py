@@ -197,7 +197,7 @@ class AdguardManager:
 
         # Re-attach known VPN containers to the DNS network so they can reach
         # AdGuard at target_ip (mirrors what dns_manager.py does on install).
-        for c in ('amnezia-awg', 'amnezia-awg2', 'amnezia-awg-legacy', 'amnezia-xray', 'amnezia-wireguard', 'telemt'):
+        for c in ('amnezia-awg', 'amnezia-awg3', 'amnezia-awg2', 'amnezia-awg-legacy', 'amnezia-xray', 'amnezia-wireguard', 'telemt'):
             self.ssh.run_sudo_command(
                 f"docker ps --format '{{{{.Names}}}}' | grep -q '^{c}$' && "
                 f"docker network connect {self.NETWORK_NAME} {c} 2>/dev/null || true"

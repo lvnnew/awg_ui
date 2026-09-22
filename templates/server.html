@@ -62,14 +62,39 @@
 </div>
 
 <div class="protocol-cards" id="protocols-grid">
-    <!-- AWG2 Card (first - new version) -->
+    <!-- AWG3 Card (newest) -->
+    <div class="card card-hover protocol-card protocol-awg" id="proto-awg3">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
+            <div class="protocol-icon">🛡️</div>
+            <div class="flex gap-sm" id="awg3-ctrl" style="display:none!important;"></div>
+        </div>
+        <div class="protocol-name">AmneziaWG 3.1 <span
+                style="font-size:0.65rem; background:var(--accent); color:#fff; padding:2px 6px; border-radius:8px; vertical-align:middle;">NEW</span>
+        </div>
+        <div class="protocol-desc">
+            Header Protection + RandomTrailers. Requires AmneziaVPN ≥ 5.0.1.5
+        </div>
+        <div class="protocol-status" id="awg3-status">
+            <span class="badge badge-warn"><span class="badge-dot"></span> {{ _('not_checked') }}</span>
+        </div>
+        <div id="awg3-info" class="hidden">
+            <div class="protocol-info" id="awg3-info-grid"></div>
+        </div>
+        <div class="flex gap-sm" id="awg3-actions">
+            <button class="btn btn-primary btn-sm" onclick="openInstallModal('awg3')" id="awg3-install-btn"
+                style="flex:1">
+                {{ _('install') }}
+            </button>
+        </div>
+    </div>
+
+    <!-- AWG2 Card -->
     <div class="card card-hover protocol-card protocol-awg" id="proto-awg2">
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:var(--space-sm);">
             <div class="protocol-icon">✨</div>
             <div class="flex gap-sm" id="awg2-ctrl" style="display:none!important;"></div>
         </div>
-        <div class="protocol-name">AmneziaWG 2.0 <span
-                style="font-size:0.65rem; background:var(--accent); color:#fff; padding:2px 6px; border-radius:8px; vertical-align:middle;">NEW</span>
+        <div class="protocol-name">AmneziaWG 2.0
         </div>
         <div class="protocol-desc">
             {{ _('awg_desc') }}
@@ -358,6 +383,7 @@
             <select class="form-select" id="connProtoSelect" onchange="loadConnections()"
                 style="width:auto; min-width:160px;">
                 <option value="awg">AmneziaWG</option>
+                <option value="awg3">AmneziaWG 3.1</option>
                 <option value="awg2">AmneziaWG 2.0</option>
                 <option value="awg_legacy">AWG Legacy</option>
                 <option value="xray">Xray</option>
@@ -732,6 +758,7 @@
     function getProtoTitle(proto) {
         switch (proto) {
             case 'awg': return 'AmneziaWG';
+            case 'awg3': return 'AmneziaWG 3.1';
             case 'awg2': return 'AmneziaWG 2.0';
             case 'awg_legacy': return 'AWG Legacy';
             case 'xray': return 'Xray';
@@ -792,7 +819,7 @@
 
                 for (const [proto, info] of Object.entries(data.protocols)) {
                     updateProtocolCard(proto, info);
-                    const isVPN = ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard'].includes(proto);
+                    const isVPN = ['awg', 'awg3', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard'].includes(proto);
                     if (info.container_running && isVPN) {
                         const opt = document.createElement('option');
                         opt.value = proto;
@@ -833,7 +860,7 @@
     }
 
     function updateStatusCounts(protocols) {
-        const protos = ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard'];
+        const protos = ['awg', 'awg3', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard'];
         const servs = ['dns', 'adguard', 'socks5'];
 
         let pRunning = 0, pTotal = protos.length;
@@ -1124,6 +1151,11 @@
             portInput.disabled = false;
             portHint.textContent = _('adguard_dns_port_hint');
             adguardOpts.style.display = 'block';
+        } else if (proto === 'awg3') {
+            portLabel.textContent = _('port') + ' (UDP)';
+            portInput.value = '55425';
+            portInput.disabled = false;
+            portHint.textContent = 'Default 55425 (avoids clash with classic AWG on 55424). Needs AmneziaVPN ≥ 5.0.1.5';
         } else {
             portLabel.textContent = _('port') + ' (UDP)';
             portInput.value = '55424';

@@ -1611,7 +1611,7 @@ def _scrape_server_traffic(server, sid, my_conns):
     try:
         ssh = get_ssh(server)
         ssh.connect()
-        for proto in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard']:
+        for proto in ['awg', 'awg3', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard']:
             if proto in server.get('protocols', {}):
                 manager = get_protocol_manager(ssh, proto)
                 clients = _manager_call(manager, 'get_clients', proto)
@@ -2273,7 +2273,7 @@ async def api_check_server(request: Request, server_id: int):
                 return proto, None, str(e)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
-            futures = [executor.submit(check_proto, p) for p in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard']]
+            futures = [executor.submit(check_proto, p) for p in ['awg', 'awg3', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard']]
             for future in concurrent.futures.as_completed(futures):
                 proto, result, err = future.result()
                 if err:
@@ -2311,7 +2311,7 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         data = load_data()
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
-        if req.protocol not in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard']:
+        if req.protocol not in ['awg', 'awg3', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard']:
             return JSONResponse({'error': 'Invalid protocol type'}, status_code=400)
 
         server = data['servers'][server_id]
@@ -2493,6 +2493,7 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
 
 CONTAINER_NAMES = {
     'awg': 'amnezia-awg',
+    'awg3': 'amnezia-awg3',
     'awg2': 'amnezia-awg2',
     'awg_legacy': 'amnezia-awg-legacy',
     'xray': 'amnezia-xray',
