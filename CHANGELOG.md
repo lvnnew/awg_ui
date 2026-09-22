@@ -16,7 +16,8 @@
   (`/24` → at_risk, точное попадание → blocked) и симптом «застывший» handshake
   AmneziaWG при живых peers. Алерты только админам в Telegram. Settings +
   `GET/POST /api/rkn_monitor/settings`, `POST /api/rkn_monitor/check_now`.
-  Кэш dump: `{DATA_DIR}/rkn_cache/`.
+  Кэш dump: `{DATA_DIR}/rkn_cache/`. Стриминг-скан только IP флота (без загрузки
+  всего реестра в RAM — иначе OOM на 512Mi).
 
 ## [2026-09-20] — Telemt: лимит docker-логов
 

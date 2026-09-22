@@ -1,8 +1,8 @@
 """RKN (Roskomnadzor) blocklist monitor helpers.
 
-Downloads/caches the public zapret-info dump, matches server IPs against it,
-flags /24 neighbours as at-risk, and parses AmneziaWG `awg show` output for
-stale-handshake symptoms (DPI path blocks that are not yet in the registry).
+Downloads/caches the public zapret-info dump and matches *only* fleet IPs
+against it (streamed — never loads the full registry into RAM). Also parses
+AmneziaWG `awg show` for stale-handshake DPI symptoms.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import ipaddress
 import logging
 import os
 import re
+import shutil
 import time
 from typing import Optional
 from urllib.request import Request, urlopen
@@ -50,6 +51,8 @@ _TRANSFER_UNIT = {
     "TiB": 1024**4,
 }
 
+_LEVEL_RANK = {"ok": 0, "at_risk": 1, "blocked": 2}
+
 
 def default_rkn_monitor_settings() -> dict:
     return {
@@ -66,76 +69,40 @@ def default_rkn_monitor_settings() -> dict:
 
 
 class RknDumpIndex:
-    """In-memory IPv4 index built from zapret-info dump.csv[.gz]."""
+    """Lightweight scan result for a small set of watched IPv4 addresses.
+
+    Does NOT hold the full RKN dump in memory (that OOMs a 512Mi panel).
+    """
 
     def __init__(self):
-        self.exact: set[int] = set()
-        self.networks: list[ipaddress.IPv4Network] = []
-        self.blocked_slash24: set[int] = set()  # network_address >> 8
+        self.levels: dict[str, str] = {}  # ip -> ok|at_risk|blocked
         self.loaded_at: float = 0.0
         self.source: str = ""
-        self.entry_count: int = 0
+        self.entry_count: int = 0  # tokens inspected
+        self.watched: int = 0
 
     @property
     def ready(self) -> bool:
-        return bool(self.exact or self.networks)
+        return bool(self.source) and self.loaded_at > 0
 
-    def _add_ip(self, ip: ipaddress.IPv4Address):
-        n = int(ip)
-        self.exact.add(n)
-        self.blocked_slash24.add(n >> 8)
+    # Back-compat for status API fields that used to report set sizes
+    @property
+    def exact(self):
+        return {ip for ip, lv in self.levels.items() if lv == "blocked"}
 
-    def _add_net(self, net: ipaddress.IPv4Network):
-        if net.prefixlen == 32:
-            self._add_ip(net.network_address)
-            return
-        self.networks.append(net)
-        # Mark every /24 covered by this prefix as "neighbour pressure".
-        step = 256
-        start = int(net.network_address)
-        end = int(net.broadcast_address)
-        for addr in range(start & ~0xFF, end + 1, step):
-            self.blocked_slash24.add(addr >> 8)
-
-    def add_token(self, token: str):
-        token = (token or "").strip()
-        if not token:
-            return
-        try:
-            if "/" in token:
-                net = ipaddress.ip_network(token, strict=False)
-                if isinstance(net, ipaddress.IPv4Network):
-                    self._add_net(net)
-                    self.entry_count += 1
-            else:
-                ip = ipaddress.ip_address(token)
-                if isinstance(ip, ipaddress.IPv4Address):
-                    self._add_ip(ip)
-                    self.entry_count += 1
-        except ValueError:
-            return
+    @property
+    def networks(self):
+        return []
 
     def match_ip(self, ip_str: str) -> str:
-        """Return 'blocked', 'at_risk' (/24 neighbour), or 'ok'."""
-        try:
-            ip = ipaddress.ip_address((ip_str or "").strip())
-        except ValueError:
-            return "ok"
-        if not isinstance(ip, ipaddress.IPv4Address):
-            return "ok"
-        n = int(ip)
-        if n in self.exact:
-            return "blocked"
-        for net in self.networks:
-            if ip in net:
-                return "blocked"
-        if (n >> 8) in self.blocked_slash24:
-            return "at_risk"
-        return "ok"
+        ip = (ip_str or "").strip()
+        return self.levels.get(ip, "ok")
 
 
 _index: Optional[RknDumpIndex] = None
 _index_lock = __import__("threading").RLock()
+_dump_path: Optional[str] = None
+_dump_fetched_at: float = 0.0
 
 
 def cache_dir_for_data_file(data_file: str) -> str:
@@ -143,57 +110,191 @@ def cache_dir_for_data_file(data_file: str) -> str:
     return os.path.join(base, "rkn_cache")
 
 
-def _parse_dump_bytes(raw: bytes, source: str) -> RknDumpIndex:
-    if raw[:2] == b"\x1f\x8b":
-        raw = gzip.decompress(raw)
-    text = raw.decode("utf-8", errors="ignore")
-    idx = RknDumpIndex()
-    idx.source = source
-    for line in text.splitlines():
-        if not line or line.startswith("Updated:") or line.lower().startswith("ip;"):
-            continue
-        # dump.csv: first field is "ip | ip | cidr", semicolon-separated columns
-        first = line.split(";", 1)[0]
-        for part in first.split("|"):
-            idx.add_token(part.strip())
-    # Keep networks sorted by prefix length (more specific first) for faster hit
-    idx.networks.sort(key=lambda n: n.prefixlen, reverse=True)
-    idx.loaded_at = time.time()
-    return idx
+def _dump_paths(cache_dir: str) -> tuple[str, str]:
+    return (
+        os.path.join(cache_dir, "dump.csv.gz"),
+        os.path.join(cache_dir, "dump.csv"),
+    )
 
 
-def load_dump_from_cache(cache_dir: str) -> Optional[RknDumpIndex]:
-    path = os.path.join(cache_dir, "dump.csv.gz")
-    alt = os.path.join(cache_dir, "dump.csv")
-    try:
-        if os.path.isfile(path):
-            with open(path, "rb") as f:
-                return _parse_dump_bytes(f.read(), path)
-        if os.path.isfile(alt):
-            with open(alt, "rb") as f:
-                return _parse_dump_bytes(f.read(), alt)
-    except Exception as e:
-        logger.warning("RKN cache load failed: %s", e)
+def find_cached_dump(cache_dir: str) -> Optional[str]:
+    gz, plain = _dump_paths(cache_dir)
+    if os.path.isfile(gz) and os.path.getsize(gz) > 0:
+        return gz
+    if os.path.isfile(plain) and os.path.getsize(plain) > 0:
+        return plain
     return None
 
 
-def download_dump(url: str, cache_dir: str, timeout: int = 120) -> RknDumpIndex:
+def download_dump(url: str, cache_dir: str, timeout: int = 180) -> str:
+    """Stream dump to disk (no full-body RAM buffer)."""
     os.makedirs(cache_dir, exist_ok=True)
-    req = Request(url, headers={"User-Agent": "awg-fork-rkn-monitor/1.0"})
-    with urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
+    req = Request(url, headers={"User-Agent": "awg-fork-rkn-monitor/1.1"})
     dest = os.path.join(
         cache_dir,
-        "dump.csv.gz" if raw[:2] == b"\x1f\x8b" or url.endswith(".gz") else "dump.csv",
+        "dump.csv.gz" if url.endswith(".gz") else "dump.csv",
     )
     tmp = dest + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(raw)
+    with urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as out:
+        # Prefer Content-Encoding-aware body as-is (github serves .gz raw)
+        shutil.copyfileobj(resp, out, length=1024 * 1024)
     os.replace(tmp, dest)
     meta = os.path.join(cache_dir, "meta.txt")
     with open(meta, "w", encoding="utf-8") as f:
-        f.write(f"url={url}\nfetched_at={time.time()}\nsize={len(raw)}\n")
-    return _parse_dump_bytes(raw, dest)
+        f.write(f"url={url}\nfetched_at={time.time()}\nsize={os.path.getsize(dest)}\n")
+    logger.info("RKN dump saved %s (%s bytes)", dest, os.path.getsize(dest))
+    return dest
+
+
+def ensure_dump_file(
+    cache_dir: str,
+    url: str = DEFAULT_DUMP_URL,
+    refresh_seconds: int = 14400,
+    force: bool = False,
+) -> str:
+    """Return path to a fresh-enough dump file on disk."""
+    global _dump_path, _dump_fetched_at
+    with _index_lock:
+        now = time.time()
+        cached = find_cached_dump(cache_dir)
+        if (
+            not force
+            and cached
+            and (now - os.path.getmtime(cached)) < refresh_seconds
+        ):
+            _dump_path = cached
+            _dump_fetched_at = os.path.getmtime(cached)
+            return cached
+        try:
+            path = download_dump(url, cache_dir)
+            _dump_path = path
+            _dump_fetched_at = time.time()
+            return path
+        except Exception as e:
+            logger.error("RKN dump download failed: %s", e)
+            if cached:
+                _dump_path = cached
+                _dump_fetched_at = os.path.getmtime(cached)
+                return cached
+            raise
+
+
+def _open_dump_text(path: str):
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="ignore")
+    return open(path, "rt", encoding="utf-8", errors="ignore")
+
+
+def _raise_level(cur: str, new: str) -> str:
+    return new if _LEVEL_RANK.get(new, 0) > _LEVEL_RANK.get(cur, 0) else cur
+
+
+def match_ips_in_dump(dump_path: str, ip_list: list[str]) -> RknDumpIndex:
+    """Stream-scan dump; only track the given IPv4 addresses (O(fleet) memory)."""
+    idx = RknDumpIndex()
+    idx.source = dump_path
+    # watch: ip_str -> {n, s24, level}
+    watches: dict[str, dict] = {}
+    by_int: dict[int, str] = {}
+    by_s24: dict[int, list[str]] = {}
+
+    for raw in ip_list:
+        ip_s = (raw or "").strip()
+        if not ip_s or ip_s in watches:
+            continue
+        try:
+            ip = ipaddress.ip_address(ip_s)
+        except ValueError:
+            continue
+        if not isinstance(ip, ipaddress.IPv4Address):
+            continue
+        n = int(ip)
+        watches[ip_s] = {"n": n, "s24": n >> 8, "level": "ok"}
+        by_int[n] = ip_s
+        by_s24.setdefault(n >> 8, []).append(ip_s)
+
+    idx.watched = len(watches)
+    if not watches:
+        idx.loaded_at = time.time()
+        return idx
+
+    tokens = 0
+    try:
+        with _open_dump_text(dump_path) as fh:
+            for line in fh:
+                if not line or line.startswith("Updated:") or line.lower().startswith("ip;"):
+                    continue
+                first = line.split(";", 1)[0]
+                for part in first.split("|"):
+                    token = part.strip()
+                    if not token:
+                        continue
+                    tokens += 1
+                    try:
+                        if "/" in token:
+                            net = ipaddress.ip_network(token, strict=False)
+                            if not isinstance(net, ipaddress.IPv4Network):
+                                continue
+                            # Exact /32
+                            if net.prefixlen == 32:
+                                hit = by_int.get(int(net.network_address))
+                                if hit:
+                                    watches[hit]["level"] = "blocked"
+                                # neighbour pressure for same /24
+                                s24 = int(net.network_address) >> 8
+                                for wip in by_s24.get(s24, []):
+                                    if watches[wip]["level"] != "blocked":
+                                        watches[wip]["level"] = _raise_level(
+                                            watches[wip]["level"], "at_risk"
+                                        )
+                                continue
+                            # CIDR contains a watched IP → blocked
+                            for wip, w in watches.items():
+                                if w["level"] == "blocked":
+                                    continue
+                                if ipaddress.IPv4Address(w["n"]) in net:
+                                    w["level"] = "blocked"
+                                elif (int(net.network_address) >> 8) <= w["s24"] <= (
+                                    int(net.broadcast_address) >> 8
+                                ):
+                                    # overlapping /24 space → neighbour risk if not blocked
+                                    w["level"] = _raise_level(w["level"], "at_risk")
+                        else:
+                            ip = ipaddress.ip_address(token)
+                            if not isinstance(ip, ipaddress.IPv4Address):
+                                continue
+                            n = int(ip)
+                            hit = by_int.get(n)
+                            if hit:
+                                watches[hit]["level"] = "blocked"
+                                continue
+                            for wip in by_s24.get(n >> 8, []):
+                                if watches[wip]["level"] != "blocked":
+                                    watches[wip]["level"] = _raise_level(
+                                        watches[wip]["level"], "at_risk"
+                                    )
+                    except ValueError:
+                        continue
+    except Exception as e:
+        logger.error("RKN dump scan failed: %s", e)
+        raise
+
+    idx.entry_count = tokens
+    idx.levels = {ip: w["level"] for ip, w in watches.items()}
+    idx.loaded_at = time.time()
+    try:
+        idx.dump_mtime = os.path.getmtime(dump_path)
+    except OSError:
+        idx.dump_mtime = idx.loaded_at
+    logger.info(
+        "RKN scan done path=%s watched=%s tokens≈%s blocked=%s at_risk=%s",
+        dump_path,
+        idx.watched,
+        tokens,
+        sum(1 for lv in idx.levels.values() if lv == "blocked"),
+        sum(1 for lv in idx.levels.values() if lv == "at_risk"),
+    )
+    return idx
 
 
 def ensure_dump_index(
@@ -201,52 +302,28 @@ def ensure_dump_index(
     url: str = DEFAULT_DUMP_URL,
     refresh_seconds: int = 14400,
     force: bool = False,
+    watch_ips: Optional[list[str]] = None,
 ) -> RknDumpIndex:
-    """Return shared index, refreshing from network when stale/missing."""
+    """Ensure dump file exists, then (re)scan for watch_ips."""
     global _index
+    path = ensure_dump_file(cache_dir, url=url, refresh_seconds=refresh_seconds, force=force)
+    ips = list(watch_ips or [])
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0.0
     with _index_lock:
-        now = time.time()
         if (
             not force
             and _index is not None
             and _index.ready
-            and (now - _index.loaded_at) < refresh_seconds
+            and _index.source == path
+            and set(_index.levels.keys()) == set(ips)
+            and getattr(_index, "dump_mtime", None) == mtime
         ):
             return _index
-
-        cached = load_dump_from_cache(cache_dir)
-        if (
-            not force
-            and cached is not None
-            and cached.ready
-            and (now - os.path.getmtime(cached.source)) < refresh_seconds
-        ):
-            _index = cached
-            logger.info(
-                "RKN dump loaded from cache: %s exact=%s nets=%s",
-                cached.source,
-                len(cached.exact),
-                len(cached.networks),
-            )
-            return _index
-
-        try:
-            _index = download_dump(url, cache_dir)
-            logger.info(
-                "RKN dump downloaded: exact=%s nets=%s slash24=%s",
-                len(_index.exact),
-                len(_index.networks),
-                len(_index.blocked_slash24),
-            )
-            return _index
-        except Exception as e:
-            logger.error("RKN dump download failed: %s", e)
-            if cached is not None and cached.ready:
-                _index = cached
-                return _index
-            if _index is not None and _index.ready:
-                return _index
-            raise
+        _index = match_ips_in_dump(path, ips)
+        return _index
 
 
 def get_dump_index() -> Optional[RknDumpIndex]:
@@ -294,7 +371,11 @@ def parse_awg_show(output: str) -> list[dict]:
         if raw.startswith("peer:"):
             if cur:
                 peers.append(cur)
-            cur = {"public_key": raw.split(":", 1)[1].strip(), "handshake_age": None, "transfer": 0}
+            cur = {
+                "public_key": raw.split(":", 1)[1].strip(),
+                "handshake_age": None,
+                "transfer": 0,
+            }
             continue
         if cur is None:
             continue
@@ -312,16 +393,8 @@ def evaluate_handshake_symptom(
     peers: list[dict],
     stale_hours: float = 6.0,
 ) -> Optional[str]:
-    """Return reason string if peers look DPI-blocked; else None.
-
-    Ignores unused peers (zero transfer, never handshaked). Requires at least
-    one peer that previously exchanged traffic.
-    """
+    """Return reason string if peers look DPI-blocked; else None."""
     stale_sec = max(1.0, float(stale_hours)) * 3600
-    active = [p for p in peers if (p.get("transfer") or 0) > 0 or p.get("handshake_age") is not None]
-    if not active:
-        return None
-    # Peers that ever had traffic are the signal; if all of those are stale → risk
     with_history = [p for p in peers if (p.get("transfer") or 0) > 0]
     if not with_history:
         return None
@@ -405,9 +478,8 @@ def check_server_handshakes(ssh, protocols: dict, stale_hours: float = 6.0) -> d
 
 
 def merge_levels(*levels: str) -> str:
-    order = {"ok": 0, "at_risk": 1, "blocked": 2}
     best = "ok"
     for lv in levels:
-        if order.get(lv, 0) > order.get(best, 0):
+        if _LEVEL_RANK.get(lv, 0) > _LEVEL_RANK.get(best, 0):
             best = lv
     return best

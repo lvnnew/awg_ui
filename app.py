@@ -41,6 +41,7 @@ from managers.rkn_monitor import (
     ensure_dump_index,
     get_dump_index,
     merge_levels,
+    resolve_host_ipv4,
 )
 from managers.s3_backup import (
     default_backup_settings,
@@ -1597,11 +1598,20 @@ def run_rkn_checks(cfg: dict) -> list:
     servers = data.get('servers') or []
     index = None
     if cfg.get('check_registry', True):
+        watch_ips = []
+        for s in servers:
+            host = s.get('host') or ''
+            if not host:
+                continue
+            ip = resolve_host_ipv4(host)
+            if ip:
+                watch_ips.append(ip)
         try:
             index = ensure_dump_index(
                 cache_dir_for_data_file(DATA_FILE),
                 url=(cfg.get('dump_url') or default_rkn_monitor_settings()['dump_url']),
                 refresh_seconds=max(3600, int(cfg.get('dump_refresh_seconds', 14400) or 14400)),
+                watch_ips=watch_ips,
             )
         except Exception as e:
             logger.error('RKN dump unavailable: %s', e)
@@ -3951,6 +3961,8 @@ async def api_get_rkn_monitor_settings(request: Request):
             'dump_loaded_at': idx.loaded_at if idx else None,
             'dump_exact': len(idx.exact) if idx else 0,
             'dump_networks': len(idx.networks) if idx else 0,
+            'dump_watched': getattr(idx, 'watched', 0) if idx else 0,
+            'dump_tokens': getattr(idx, 'entry_count', 0) if idx else 0,
             'last_results': _rkn_last_results,
         },
     }
