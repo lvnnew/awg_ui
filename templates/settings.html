@@ -185,6 +185,7 @@
                 </button>
                 <span class="form-hint" id="rknStatusHint" style="margin:0;"></span>
             </div>
+            <div id="rknProblemsBox" class="form-hint" style="margin-top: var(--space-sm); white-space: pre-wrap;"></div>
 
             <hr style="border:none; border-top:1px solid var(--border-color); margin: var(--space-md) 0;">
 
@@ -1356,12 +1357,26 @@
             set('rknNotifyClear', cfg.notify_clear !== false, true);
             const st = data.status || {};
             const hint = document.getElementById('rknStatusHint');
+            const box = document.getElementById('rknProblemsBox');
             if (hint) {
+                const watched = st.dump_watched || 0;
+                const tokens = st.dump_tokens || 0;
+                const blocked = st.dump_exact || 0;
                 const dump = st.dump_ready
-                    ? ('dump: ' + (st.dump_exact || 0) + ' IP, ' + (st.dump_networks || 0) + ' CIDR')
+                    ? ('dump OK · IP флота: ' + watched + (tokens ? (', токенов≈' + tokens) : '') + ', в реестре: ' + blocked)
                     : 'dump: ещё не загружен';
                 const bad = (st.last_results || []).filter(r => r.level && r.level !== 'ok');
-                hint.textContent = dump + (bad.length ? ('; · проблем: ' + bad.length) : '');
+                hint.textContent = dump + (bad.length ? (' · проблем: ' + bad.length) : '');
+                if (box) {
+                    if (!bad.length) {
+                        box.textContent = '';
+                    } else {
+                        box.textContent = bad.map(r => {
+                            const sum = r.summary || ((r.reasons || []).join('; ')) || r.level;
+                            return '• ' + (r.name || r.host || '?') + ' [' + r.level + '] ' + (r.ip || '') + '\n  ' + sum;
+                        }).join('\n');
+                    }
+                }
             }
         } catch (err) { /* non-critical */ }
     }
@@ -1410,12 +1425,12 @@
             const data = await res.json();
             if (res.ok) {
                 const bad = (data.results || []).filter(r => r.level && r.level !== 'ok');
-                showToast(
-                    bad.length
-                        ? ('Проверка: проблем ' + bad.length + ' из ' + (data.results || []).length)
-                        : ('Проверка: все OK (' + (data.results || []).length + ')'),
-                    bad.length ? 'error' : 'success'
-                );
+                if (!bad.length) {
+                    showToast('Проверка: все OK (' + (data.results || []).length + ')', 'success');
+                } else {
+                    const msg = bad.map(r => (r.name || r.host) + ': ' + (r.summary || r.level)).join(' | ');
+                    showToast('Проблем ' + bad.length + ': ' + msg, 'error');
+                }
                 await loadRknMonitorSettings();
             } else {
                 showToast(data.error || 'Ошибка проверки', 'error');

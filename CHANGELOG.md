@@ -17,7 +17,8 @@
   AmneziaWG при живых peers. Алерты только админам в Telegram. Settings +
   `GET/POST /api/rkn_monitor/settings`, `POST /api/rkn_monitor/check_now`.
   Кэш dump: `{DATA_DIR}/rkn_cache/`. Стриминг-скан только IP флота (без загрузки
-  всего реестра в RAM — иначе OOM на 512Mi).
+  всего реестра в RAM — иначе OOM на 512Mi). В статусе/Telegram — человекочитаемое
+  описание: сервер, IP, тип сигнала, имена клиентов и давность handshake.
 
 ## [2026-09-20] — Telemt: лимит docker-логов
 

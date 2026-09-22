@@ -1546,6 +1546,7 @@ def _probe_server_rkn(server: dict, cfg: dict, index) -> dict:
     name = server.get('name') or server.get('host') or '?'
     host = server.get('host') or ''
     reasons = []
+    summaries = []
     ip = None
     reg_level = 'ok'
     hs_level = 'ok'
@@ -1556,8 +1557,10 @@ def _probe_server_rkn(server: dict, cfg: dict, index) -> dict:
             reg_level = reg.get('level') or 'ok'
             ip = reg.get('ip')
             reasons.extend(reg.get('reasons') or [])
+            summaries.extend(reg.get('summaries') or [])
         except Exception as e:
             reasons.append(f'registry_error:{e}')
+            summaries.append(f'ошибка проверки реестра: {e}')
 
     if cfg.get('check_handshake', True):
         protocols = server.get('protocols') or {}
@@ -1573,8 +1576,10 @@ def _probe_server_rkn(server: dict, cfg: dict, index) -> dict:
                 )
                 hs_level = hs.get('level') or 'ok'
                 reasons.extend(hs.get('reasons') or [])
+                summaries.extend(hs.get('summaries') or [])
             except Exception as e:
                 reasons.append(f'handshake_error:{e}')
+                summaries.append(f'ошибка проверки handshake: {e}')
             finally:
                 try:
                     if ssh:
@@ -1583,12 +1588,17 @@ def _probe_server_rkn(server: dict, cfg: dict, index) -> dict:
                     pass
 
     level = merge_levels(reg_level, hs_level)
+    summary = '; '.join(summaries) if summaries else (
+        'OK' if level == 'ok' else level
+    )
     return {
         'name': name,
         'host': host,
         'ip': ip,
         'level': level,
         'reasons': reasons,
+        'summaries': summaries,
+        'summary': summary,
     }
 
 
@@ -1652,7 +1662,7 @@ def _apply_rkn_probe(results: list, threshold: int, notify_clear: bool):
         name = row.get('name') or key
         host = row.get('host') or key
         ip = row.get('ip') or host
-        detail = ', '.join(row.get('reasons') or []) or None
+        detail = row.get('summary') or (', '.join(row.get('reasons') or []) or None)
 
         if not _rkn_primed:
             st['level'] = level

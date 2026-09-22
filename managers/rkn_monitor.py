@@ -389,11 +389,29 @@ def parse_awg_show(output: str) -> list[dict]:
     return peers
 
 
+def format_age(seconds: Optional[int]) -> str:
+    if seconds is None:
+        return "никогда"
+    s = int(seconds)
+    days, rem = divmod(s, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = []
+    if days:
+        parts.append(f"{days}д")
+    if hours or days:
+        parts.append(f"{hours}ч")
+    if not days:
+        parts.append(f"{minutes}м")
+    return " ".join(parts)
+
+
 def evaluate_handshake_symptom(
     peers: list[dict],
     stale_hours: float = 6.0,
-) -> Optional[str]:
-    """Return reason string if peers look DPI-blocked; else None."""
+    name_by_key: Optional[dict] = None,
+) -> Optional[dict]:
+    """If peers look unreachable, return structured symptom details."""
     stale_sec = max(1.0, float(stale_hours)) * 3600
     with_history = [p for p in peers if (p.get("transfer") or 0) > 0]
     if not with_history:
@@ -402,11 +420,71 @@ def evaluate_handshake_symptom(
         age = p.get("handshake_age")
         if age is not None and age < stale_sec:
             return None
-    oldest = max((p.get("handshake_age") or 10**9) for p in with_history)
-    if oldest >= stale_sec:
-        hours = round(oldest / 3600, 1)
-        return f"no_handshake:{len(with_history)}_peers_stale>={hours}h"
-    return None
+
+    names = name_by_key or {}
+    stale_peers = []
+    for p in with_history:
+        key = p.get("public_key") or ""
+        age = p.get("handshake_age")
+        stale_peers.append({
+            "name": names.get(key) or (key[:8] + "…" if key else "?"),
+            "public_key": key,
+            "age_seconds": age,
+            "age_label": format_age(age),
+            "transfer": p.get("transfer") or 0,
+        })
+    oldest = max((p.get("age_seconds") or 10**9) for p in stale_peers)
+    return {
+        "code": "no_handshake",
+        "stale_count": len(stale_peers),
+        "oldest_seconds": oldest if oldest < 10**9 else None,
+        "threshold_hours": float(stale_hours),
+        "peers": stale_peers,
+    }
+
+
+def humanize_handshake_symptom(proto: str, sym: dict) -> str:
+    """Russian one-liner for UI/Telegram."""
+    names = [p.get("name") for p in (sym.get("peers") or []) if p.get("name")]
+    names_s = ", ".join(names[:5])
+    if len(names) > 5:
+        names_s += f" и ещё {len(names) - 5}"
+    age = format_age(sym.get("oldest_seconds"))
+    thr = sym.get("threshold_hours") or 6
+    return (
+        f"{proto}: нет живого handshake ≥{thr}ч у {sym.get('stale_count', 0)} "
+        f"клиент(ов) с трафиком (давность до {age})"
+        + (f" — {names_s}" if names_s else "")
+    )
+
+
+def load_awg_client_names(ssh, container: str) -> dict:
+    """Map peer public key → clientName from clientsTable JSON."""
+    import json as _json
+
+    cmd = f"docker exec {container} cat /opt/amnezia/awg/clientsTable 2>/dev/null"
+    try:
+        if hasattr(ssh, "run_sudo_command"):
+            out, _err, code = ssh.run_sudo_command(cmd, timeout=30)
+        else:
+            out, _err, code = ssh.run_command(cmd, timeout=30)
+    except Exception:
+        return {}
+    if code != 0 or not out:
+        return {}
+    try:
+        rows = _json.loads(out)
+    except Exception:
+        return {}
+    names = {}
+    if isinstance(rows, list):
+        for row in rows:
+            cid = row.get("clientId") or row.get("public_key")
+            ud = row.get("userData") or {}
+            name = ud.get("clientName") or row.get("clientName")
+            if cid and name:
+                names[cid] = name
+    return names
 
 
 def resolve_host_ipv4(host: str) -> Optional[str]:
@@ -435,19 +513,30 @@ def resolve_host_ipv4(host: str) -> Optional[str]:
 def check_server_registry(index: RknDumpIndex, host: str) -> dict:
     ip = resolve_host_ipv4(host)
     if not ip:
-        return {"level": "ok", "ip": None, "reasons": ["unresolved_host"]}
+        return {
+            "level": "ok",
+            "ip": None,
+            "reasons": ["unresolved_host"],
+            "summaries": ["не удалось резолвить IP хоста"],
+        }
     level = index.match_ip(ip) if index and index.ready else "ok"
     reasons = []
+    summaries = []
     if level == "blocked":
         reasons.append("in_rkn_dump")
+        summaries.append(f"IP {ip} есть в актуальном dump РКН (реестр)")
     elif level == "at_risk":
         reasons.append("slash24_neighbour_in_dump")
-    return {"level": level, "ip": ip, "reasons": reasons}
+        summaries.append(
+            f"IP {ip} нет в dump, но в той же /24 уже есть заблокированные адреса"
+        )
+    return {"level": level, "ip": ip, "reasons": reasons, "summaries": summaries}
 
 
 def check_server_handshakes(ssh, protocols: dict, stale_hours: float = 6.0) -> dict:
     """SSH into server and inspect awg containers for stale handshakes."""
     reasons = []
+    summaries = []
     details = []
     for proto, container in AWG_CONTAINERS.items():
         if proto not in (protocols or {}):
@@ -469,12 +558,26 @@ def check_server_handshakes(ssh, protocols: dict, stale_hours: float = 6.0) -> d
         if not out:
             continue
         peers = parse_awg_show(out)
-        reason = evaluate_handshake_symptom(peers, stale_hours=stale_hours)
-        if reason:
-            reasons.append(f"{proto}:{reason}")
-            details.append(f"{proto}:peers={len(peers)}")
+        names = load_awg_client_names(ssh, container)
+        sym = evaluate_handshake_symptom(peers, stale_hours=stale_hours, name_by_key=names)
+        if sym:
+            line = humanize_handshake_symptom(proto, sym)
+            reasons.append(
+                f"{proto}:no_handshake:{sym['stale_count']}_peers_stale>={format_age(sym.get('oldest_seconds'))}"
+            )
+            summaries.append(line)
+            details.append({
+                "protocol": proto,
+                "container": container,
+                "symptom": sym,
+            })
     level = "at_risk" if reasons else "ok"
-    return {"level": level, "reasons": reasons, "details": details}
+    return {
+        "level": level,
+        "reasons": reasons,
+        "summaries": summaries,
+        "details": details,
+    }
 
 
 def merge_levels(*levels: str) -> str:

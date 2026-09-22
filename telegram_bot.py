@@ -337,24 +337,31 @@ async def notify_rkn_alert(
     """Admin-only alert about RKN dump hits / DPI handshake symptoms."""
     name = html.escape(server_name or host or "сервер")
     addr = html.escape(ip or host or "")
-    reasons = ""
+    detail_block = ""
     if detail:
-        reasons = "\n" + html.escape(str(detail))
+        detail_block = "\n" + html.escape(str(detail))
     if kind == "blocked":
         text = (
-            f"⛔ <b>IP в реестре РКН:</b> {name}\n"
-            f"<code>{addr}</code>{reasons}"
+            f"⛔ <b>IP в реестре РКН</b>\n"
+            f"Сервер: {name}\n"
+            f"IP: <code>{addr}</code>"
+            f"{detail_block}"
         )
     elif kind == "at_risk":
         text = (
-            f"⚠️ <b>Риск блокировки РКН/DPI:</b> {name}\n"
-            f"<code>{addr}</code>{reasons}"
+            f"⚠️ <b>Риск блокировки / нет ответа VPN</b>\n"
+            f"Сервер: {name}\n"
+            f"IP: <code>{addr}</code>"
+            f"{detail_block}\n\n"
+            f"<i>Это не обязательно запись в реестре РКН: может быть DPI, "
+            f"фильтр провайдера или просто давно не подключавшиеся клиенты.</i>"
         )
     elif kind == "clear":
         prev = html.escape(level or "problem")
         text = (
-            f"✅ <b>РКН-статус снят ({prev}):</b> {name}\n"
-            f"<code>{addr}</code>"
+            f"✅ <b>РКН-статус снят</b> (было: {prev})\n"
+            f"Сервер: {name}\n"
+            f"IP: <code>{addr}</code>"
         )
     else:
         return
