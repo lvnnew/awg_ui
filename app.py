@@ -1534,6 +1534,73 @@ _rkn_primed = False
 _rkn_last_results: list = []
 
 
+def _rkn_snapshot_rows(results: list) -> list:
+    """Compact rows safe to persist (no huge details blobs)."""
+    out = []
+    for r in results or []:
+        out.append({
+            'name': r.get('name'),
+            'host': r.get('host'),
+            'ip': r.get('ip'),
+            'ips': r.get('ips') or [],
+            'level': r.get('level') or 'ok',
+            'reasons': list(r.get('reasons') or [])[:20],
+            'summary': r.get('summary') or '',
+        })
+    return out
+
+
+def _persist_rkn_snapshot(results: list, state: dict, primed: bool):
+    """Keep last RKN view across pod restarts (UI reads memory, restored on boot)."""
+    try:
+        data = load_data()
+        snap = data.setdefault('settings', {}).setdefault('rkn_monitor_snapshot', {})
+        snap['primed'] = bool(primed)
+        snap['updated_at'] = datetime.now().isoformat()
+        snap['last_results'] = _rkn_snapshot_rows(results)
+        snap['state'] = {
+            k: {
+                'level': (v or {}).get('level') or 'ok',
+                'fails': int((v or {}).get('fails') or 0),
+                'alerted_level': (v or {}).get('alerted_level'),
+            }
+            for k, v in (state or {}).items()
+        }
+        save_data(data)
+    except Exception as e:
+        logger.warning('persist rkn snapshot failed: %s', e)
+
+
+def _restore_rkn_snapshot():
+    """Load last RKN results into memory so Monitor/badges are not empty after deploy."""
+    global _rkn_primed, _rkn_last_results, _rkn_state
+    try:
+        data = load_data()
+        snap = (data.get('settings') or {}).get('rkn_monitor_snapshot') or {}
+        rows = snap.get('last_results')
+        if isinstance(rows, list) and rows:
+            _rkn_last_results = list(rows)
+        st = snap.get('state')
+        if isinstance(st, dict) and st:
+            _rkn_state = {
+                k: {
+                    'level': (v or {}).get('level') or 'ok',
+                    'fails': int((v or {}).get('fails') or 0),
+                    'alerted_level': (v or {}).get('alerted_level'),
+                }
+                for k, v in st.items()
+            }
+        if snap.get('primed'):
+            _rkn_primed = True
+        if _rkn_last_results:
+            logger.info(
+                'Restored RKN snapshot: %s servers, primed=%s',
+                len(_rkn_last_results), _rkn_primed,
+            )
+    except Exception as e:
+        logger.warning('restore rkn snapshot failed: %s', e)
+
+
 def _probe_server_rkn(server: dict, cfg: dict, index) -> dict:
     """Blocking single-server RKN check (registry + handshake + optional RU probe)."""
     name = server.get('name') or server.get('host') or '?'
@@ -1762,10 +1829,12 @@ def _apply_rkn_probe(results: list, threshold: int, notify_clear: bool):
     if not _rkn_primed and results is not None:
         _rkn_primed = True
 
+    _persist_rkn_snapshot(_rkn_last_results, _rkn_state, _rkn_primed)
+
 
 async def periodic_rkn_monitor():
     """Poll RKN dump + AWG handshake symptoms; notify admins on status changes."""
-    await asyncio.sleep(90)
+    await asyncio.sleep(15)
     while True:
         interval = 900
         try:
@@ -1866,6 +1935,8 @@ async def startup():
 
     if changed:
         save_data(data)
+
+    _restore_rkn_snapshot()
 
     # Start periodic background tasks
     asyncio.create_task(periodic_background_tasks())

@@ -243,9 +243,15 @@
                         onchange="saveRknMonitorSettings()">
                 </div>
             </div>
-            <p class="form-hint" style="margin-top: var(--space-sm);">
-                <a href="/monitor">{{ _('monitor_hub_open') }}</a>
-            </p>
+            <p class="form-hint" style="margin-top: var(--space-sm);" id="rknStatusHint"></p>
+            <pre class="form-hint" id="rknProblemsBox" style="white-space:pre-wrap; margin-top: var(--space-xs);"></pre>
+            <div style="margin-top: var(--space-sm); display:flex; gap:8px; flex-wrap:wrap;">
+                <button type="button" class="btn btn-secondary btn-sm" id="rknCheckNowBtn" onclick="rknCheckNow()">
+                    <span id="rknCheckNowText">{{ _('rkn_monitor_check_now') }}</span>
+                    <span id="rknCheckNowSpin" class="hidden">…</span>
+                </button>
+                <a href="/monitor" class="btn btn-secondary btn-sm">{{ _('monitor_hub_open') }}</a>
+            </div>
 
             
         </div>
