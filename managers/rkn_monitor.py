@@ -826,28 +826,52 @@ def _ssh_run(ssh, cmd: str, timeout: int = 30):
 
 
 def start_udp_echo(ssh, port: int, listen_seconds: float = 25.0) -> str:
-    """Start background UDP echo on the server; return log path.
+    """Start UDP echo; temporarily open ufw/iptables like a published VPN port.
 
-    Uses setsid + closed stdin so the SSH channel can exit while echo keeps
-    running (paramiko otherwise hangs on background jobs).
+    Hosts with ``ufw`` default DROP (common on our fleet) silently drop bare
+    :19999 even when the process is listening — that looked like TSPU. We
+    ``ufw allow`` / iptables INSERT for the test window only.
     """
     import base64
 
     log = "/tmp/awg-ru-echo.log"
     script = "/tmp/awg-ru-echo.py"
+    marker = "/tmp/awg-ru-echo.fw"
+    port = int(port)
     b64 = base64.b64encode(_UDP_ECHO_PY.encode("utf-8")).decode("ascii")
-    # Kill previous quietly in its own invocation (pkill can confuse channels).
+
     _ssh_run(ssh, "pkill -f /tmp/awg-ru-echo.py >/dev/null 2>&1 || true", timeout=10)
+
+    # Open firewall for the echo port (idempotent). Marker = we added a rule.
+    fw = (
+        f"rm -f {marker}; "
+        f"if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then "
+        f"  ufw allow {port}/udp comment 'awg-ru-echo' >/dev/null 2>&1 && echo ufw > {marker}; "
+        f"fi; "
+        f"iptables -C INPUT -p udp --dport {port} -j ACCEPT 2>/dev/null "
+        f"  || iptables -I INPUT -p udp --dport {port} -j ACCEPT; "
+        f"iptables -C INPUT -p udp --dport {port} -j ACCEPT 2>/dev/null && "
+        f"  (test -f {marker} || echo ipt > {marker}); "
+        f"true"
+    )
+    _ssh_run(ssh, fw, timeout=30)
+
     write = (
         f"echo {b64} | base64 -d > {script} && "
         f"rm -f {log} && "
-        f"setsid python3 {script} {int(port)} {log} {float(listen_seconds)} "
+        f"setsid python3 {script} {port} {log} {float(listen_seconds)} "
         f"</dev/null >/tmp/awg-ru-echo.out 2>&1 & echo $!"
     )
     out, err, code = _ssh_run(ssh, write, timeout=20)
     if code != 0:
         logger.warning("start_udp_echo failed code=%s out=%s err=%s", code, out, err)
-    time.sleep(0.5)
+    time.sleep(0.6)
+    # Confirm socket is actually listening
+    ss_out, _, _ = _ssh_run(
+        ssh, f"ss -ulnp 2>/dev/null | grep -E ':{port}\\b' || true", timeout=10
+    )
+    if not (ss_out or "").strip():
+        logger.warning("start_udp_echo: nothing listening on UDP/%s", port)
     return log
 
 
@@ -862,15 +886,29 @@ def read_udp_echo_log(ssh, log_path: str) -> list[str]:
 
 
 def stop_udp_echo(ssh, log_path: str = "/tmp/awg-ru-echo.log", port: int = DEFAULT_UDP_ECHO_PORT):
+    port = int(port)
+    marker = "/tmp/awg-ru-echo.fw"
     try:
         _ssh_run(
             ssh,
             "pkill -f /tmp/awg-ru-echo.py >/dev/null 2>&1 || true; "
+            f"if test -f {marker}; then "
+            f"  ufw delete allow {port}/udp >/dev/null 2>&1 || true; "
+            f"  iptables -D INPUT -p udp --dport {port} -j ACCEPT 2>/dev/null || true; "
+            f"  rm -f {marker}; "
+            f"fi; "
             f"rm -f {log_path} /tmp/awg-ru-echo.py /tmp/awg-ru-echo.out",
-            timeout=15,
+            timeout=20,
         )
     except Exception:
         pass
+
+
+def _echo_is_listening(ssh, port: int) -> bool:
+    out, _, _ = _ssh_run(
+        ssh, f"ss -ulnp 2>/dev/null | grep -E ':{int(port)}\\b' || true", timeout=10
+    )
+    return bool((out or "").strip())
 
 
 def _shell_quote(s: str) -> str:
@@ -912,6 +950,8 @@ def check_server_reachability(
     echo_log = None
     try:
         echo_log = start_udp_echo(ssh, int(echo_port), listen_seconds=max(15.0, timeout + 5))
+        listening = _echo_is_listening(ssh, int(echo_port))
+        details["echo_listening"] = listening
         targets = [
             {
                 "host": ip,
@@ -957,7 +997,6 @@ def check_server_reachability(
             elif proto == "udp" and ok:
                 udp_sent_ok = True
 
-        # Prefer primary IP messaging
         label_ip = primary or ips[0]
 
         if tcp_any_fail and not tcp_any_ok:
@@ -980,20 +1019,22 @@ def check_server_reachability(
             if egress and egress in echo_senders:
                 udp_recv_ok = True
             elif not egress:
-                # Probe did not report egress; any sender while we expected UDP is enough.
                 udp_recv_ok = True
             else:
-                # NAT: egress may differ from packet source seen on VPS — accept any
-                # sender if probe claimed udp send succeeded.
                 udp_recv_ok = bool(udp_sent_ok and echo_senders)
 
-        if tcp_any_ok or not tcp_any_fail:
+        if not listening:
+            reasons.append("ru_udp_echo_not_listening")
+            summaries.append(
+                f"не удалось поднять UDP-echo на {echo_port} — UDP-путь не проверен"
+            )
+        elif tcp_any_ok or not tcp_any_fail:
             if udp_sent_ok and not udp_recv_ok:
                 reasons.append("ru_udp_path_blocked")
                 summaries.append(
-                    f"с РФ UDP до {label_ip}:{echo_port} уходит с probe, "
-                    f"но на сервере пакета нет (TSPU/фильтр UDP-пути; "
-                    f"IP может быть чистым в dump). egress={egress or '?'}"
+                    f"с РФ UDP до {label_ip}:{echo_port} уходит с probe "
+                    f"(порт временно открыт в ufw), но на сервере пакета нет "
+                    f"(TSPU/фильтр UDP-пути). egress={egress or '?'}"
                 )
             elif not udp_sent_ok and tcp_any_ok:
                 reasons.append("ru_udp_send_failed")

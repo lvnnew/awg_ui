@@ -14,6 +14,8 @@
   российского egress (`tools/ru_reachability_probe`) — TSPU/UDP-path
   → `blocked`, даже если IP чистый в dump. Settings: reachability,
   probe_url / token / echo-порт. Telegram-алерты различают реестр и путь.
+  UDP-echo на время проверки временно открывается в `ufw`/iptables
+  (иначе hosts с default DROP давали ложный «UDP blocked»).
 
 ### Added
 - **SQLite storage** (`panel.db` рядом с `data.json` на PVC): пакет `storage/`
