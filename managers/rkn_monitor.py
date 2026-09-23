@@ -1,20 +1,33 @@
-"""RKN (Roskomnadzor) blocklist monitor helpers.
+"""RKN / RU path-block monitor helpers.
 
-Downloads/caches the public zapret-info dump and matches *only* fleet IPs
-against it (streamed — never loads the full registry into RAM). Also parses
-AmneziaWG `awg show` for stale-handshake DPI symptoms.
+What the public zapret-info dump covers
+---------------------------------------
+Only the published RKN registry (IP / CIDR / host lists). It does **not**
+cover TSPU / ISP UDP-path blocks, dual-IP asymmetry, or DPI that drops
+AmneziaWG without ever listing the IP.
+
+What we check
+-------------
+1. Dump match for every public IPv4 on the host (not only the panel `host`
+   field — VPS often have a second address that clients may hit).
+2. Stale AmneziaWG handshake on live peers (DPI / silent UDP symptom).
+3. Optional RU egress probe (`probe_url`): TCP to SSH + coordinated UDP echo
+   from a Russian vantage (e.g. Timeweb). TCP/UDP fail from RU → blocked
+   for connectivity even when dump says OK.
 """
 
 from __future__ import annotations
 
 import gzip
 import ipaddress
+import json
 import logging
 import os
 import re
 import shutil
 import time
 from typing import Optional
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
@@ -22,6 +35,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_DUMP_URL = (
     "https://raw.githubusercontent.com/zapret-info/z-i/master/dump.csv.gz"
 )
+
+DEFAULT_UDP_ECHO_PORT = 19999
 
 AWG_CONTAINERS = {
     "awg": "amnezia-awg",
@@ -62,9 +77,15 @@ def default_rkn_monitor_settings() -> dict:
         "fail_threshold": 2,
         "check_registry": True,
         "check_handshake": True,
+        "check_reachability": True,
         "handshake_stale_hours": 6,
         "notify_clear": True,
         "dump_url": DEFAULT_DUMP_URL,
+        # Empty = skip RU TCP/UDP path check (dump + handshake only).
+        "probe_url": "",
+        "probe_token": "",
+        "probe_udp_echo_port": DEFAULT_UDP_ECHO_PORT,
+        "probe_timeout_seconds": 20,
     }
 
 
@@ -590,27 +611,57 @@ def resolve_host_ipv4(host: str) -> Optional[str]:
     return None
 
 
-def check_server_registry(index: RknDumpIndex, host: str) -> dict:
-    ip = resolve_host_ipv4(host)
-    if not ip:
+def check_server_registry(
+    index: RknDumpIndex,
+    host: str,
+    extra_ips: Optional[list[str]] = None,
+) -> dict:
+    """Match host (+ optional secondary public IPs) against dump index."""
+    ips: list[str] = []
+    primary = resolve_host_ipv4(host)
+    if primary:
+        ips.append(primary)
+    for raw in extra_ips or []:
+        ip = (raw or "").strip()
+        if not ip or ip in ips:
+            continue
+        try:
+            parsed = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if isinstance(parsed, ipaddress.IPv4Address):
+            ips.append(ip)
+
+    if not ips:
         return {
             "level": "ok",
             "ip": None,
+            "ips": [],
             "reasons": ["unresolved_host"],
             "summaries": ["не удалось резолвить IP хоста"],
         }
-    level = index.match_ip(ip) if index and index.ready else "ok"
+
+    level = "ok"
     reasons = []
     summaries = []
-    if level == "blocked":
-        reasons.append("in_rkn_dump")
-        summaries.append(f"IP {ip} есть в актуальном dump РКН (реестр)")
-    elif level == "at_risk":
-        reasons.append("slash24_neighbour_in_dump")
-        summaries.append(
-            f"IP {ip} нет в dump, но в той же /24 уже есть заблокированные адреса"
-        )
-    return {"level": level, "ip": ip, "reasons": reasons, "summaries": summaries}
+    for ip in ips:
+        lv = index.match_ip(ip) if index and index.ready else "ok"
+        level = merge_levels(level, lv)
+        if lv == "blocked":
+            reasons.append(f"in_rkn_dump:{ip}")
+            summaries.append(f"IP {ip} есть в актуальном dump РКН (реестр)")
+        elif lv == "at_risk":
+            reasons.append(f"slash24_neighbour_in_dump:{ip}")
+            summaries.append(
+                f"IP {ip} нет в dump, но в той же /24 уже есть заблокированные адреса"
+            )
+    return {
+        "level": level,
+        "ip": primary or ips[0],
+        "ips": ips,
+        "reasons": reasons,
+        "summaries": summaries,
+    }
 
 
 def check_server_handshakes(ssh, protocols: dict, stale_hours: float = 6.0) -> dict:
@@ -673,3 +724,299 @@ def merge_levels(*levels: str) -> str:
         if _LEVEL_RANK.get(lv, 0) > _LEVEL_RANK.get(best, 0):
             best = lv
     return best
+
+
+_PRIVATE_NETS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+)
+
+
+def _is_public_ipv4(ip_s: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_s)
+    except ValueError:
+        return False
+    if not isinstance(ip, ipaddress.IPv4Address):
+        return False
+    return not any(ip in net for net in _PRIVATE_NETS)
+
+
+def list_host_ipv4s(ssh) -> list[str]:
+    """Public IPv4 addresses on the remote host (dual-homed VPS)."""
+    cmd = (
+        "hostname -I 2>/dev/null; "
+        "ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1"
+    )
+    try:
+        if hasattr(ssh, "run_sudo_command"):
+            out, _err, _code = ssh.run_sudo_command(cmd, timeout=20)
+        else:
+            out, _err, _code = ssh.run_command(cmd, timeout=20)
+    except Exception as e:
+        logger.debug("list_host_ipv4s failed: %s", e)
+        return []
+    found: list[str] = []
+    for tok in re.split(r"[\s,;]+", out or ""):
+        tok = tok.strip()
+        if not tok or not _is_public_ipv4(tok):
+            continue
+        if tok not in found:
+            found.append(tok)
+    return found
+
+
+def call_ru_probe(
+    probe_url: str,
+    targets: list[dict],
+    *,
+    token: str = "",
+    timeout: float = 20,
+) -> dict:
+    """POST /v1/probe on the RU vantage service. Returns parsed JSON."""
+    base = (probe_url or "").rstrip("/")
+    if not base:
+        raise ValueError("probe_url empty")
+    url = base + "/v1/probe"
+    body = json.dumps({"targets": targets}).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "awg-fork-rkn-monitor/1.2",
+        "Accept": "application/json",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = Request(url, data=body, headers=headers, method="POST")
+    with urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    return json.loads(raw) if raw else {}
+
+
+_UDP_ECHO_PY = r"""
+import socket, sys, time
+port = int(sys.argv[1]); log = sys.argv[2]; seconds = float(sys.argv[3])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", port))
+s.settimeout(0.5)
+open(log, "w").close()
+deadline = time.time() + seconds
+while time.time() < deadline:
+    try:
+        data, addr = s.recvfrom(2048)
+        with open(log, "a") as f:
+            f.write(addr[0] + "\n")
+        try:
+            s.sendto(b"pong", addr)
+        except Exception:
+            pass
+    except socket.timeout:
+        pass
+s.close()
+""".strip()
+
+
+def _ssh_run(ssh, cmd: str, timeout: int = 30):
+    if hasattr(ssh, "run_sudo_command"):
+        return ssh.run_sudo_command(cmd, timeout=timeout)
+    return ssh.run_command(cmd, timeout=timeout)
+
+
+def start_udp_echo(ssh, port: int, listen_seconds: float = 25.0) -> str:
+    """Start background UDP echo on the server; return log path."""
+    log = "/tmp/awg-ru-echo.log"
+    script = "/tmp/awg-ru-echo.py"
+    # Upload script via heredoc so pkill can target a stable path.
+    write_cmd = (
+        f"cat > {script} <<'AWGEOF'\n{_UDP_ECHO_PY}\nAWGEOF\n"
+        f"pkill -f '{script}' 2>/dev/null; rm -f {log}; "
+        f"nohup python3 {script} {port} {log} {listen_seconds} "
+        f">/tmp/awg-ru-echo.out 2>&1 & echo $!"
+    )
+    _ssh_run(ssh, write_cmd, timeout=20)
+    time.sleep(0.5)
+    return log
+
+
+def read_udp_echo_log(ssh, log_path: str) -> list[str]:
+    out, _err, _code = _ssh_run(ssh, f"cat {log_path} 2>/dev/null || true", timeout=10)
+    ips = []
+    for line in (out or "").splitlines():
+        ip = line.strip()
+        if ip and ip not in ips:
+            ips.append(ip)
+    return ips
+
+
+def stop_udp_echo(ssh, log_path: str = "/tmp/awg-ru-echo.log"):
+    try:
+        _ssh_run(
+            ssh,
+            "pkill -f '/tmp/awg-ru-echo.py' 2>/dev/null; "
+            f"rm -f {log_path} /tmp/awg-ru-echo.out /tmp/awg-ru-echo.py",
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+# kept for callers that imported the helper name earlier in the module body
+def _shell_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def check_server_reachability(
+    ssh,
+    host: str,
+    *,
+    probe_url: str,
+    probe_token: str = "",
+    ssh_port: int = 22,
+    echo_port: int = DEFAULT_UDP_ECHO_PORT,
+    timeout: float = 20,
+    target_ips: Optional[list[str]] = None,
+) -> dict:
+    """TCP (SSH) + coordinated UDP echo from RU probe vantage.
+
+    Requires ``probe_url`` pointing at tools/ru_reachability_probe.
+    Dump-clean IPs that fail TCP/UDP from RU are treated as path-blocked.
+    """
+    reasons = []
+    summaries = []
+    details: dict = {"egress_ip": None, "results": []}
+
+    ips = list(target_ips or [])
+    primary = resolve_host_ipv4(host)
+    if primary and primary not in ips:
+        ips.insert(0, primary)
+    if not ips:
+        return {
+            "level": "ok",
+            "reasons": ["reachability_skipped_no_ip"],
+            "summaries": [],
+            "details": details,
+        }
+
+    echo_log = None
+    try:
+        echo_log = start_udp_echo(ssh, int(echo_port), listen_seconds=max(15.0, timeout + 5))
+        targets = [
+            {
+                "host": ip,
+                "tcp_ports": [int(ssh_port)],
+                "udp_ports": [int(echo_port)],
+            }
+            for ip in ips
+        ]
+        try:
+            resp = call_ru_probe(
+                probe_url,
+                targets,
+                token=probe_token or "",
+                timeout=timeout,
+            )
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, ValueError) as e:
+            reasons.append(f"probe_error:{e}")
+            summaries.append(
+                f"RU-probe недоступен ({e}) — TCP/UDP с РФ не проверены"
+            )
+            return {
+                "level": "ok",
+                "reasons": reasons,
+                "summaries": summaries,
+                "details": details,
+            }
+
+        egress = (resp.get("egress_ip") or "").strip() or None
+        details["egress_ip"] = egress
+        details["results"] = resp.get("results") or []
+
+        tcp_any_ok = False
+        tcp_any_fail = False
+        udp_sent_ok = False
+        for row in details["results"]:
+            proto = (row.get("proto") or "").lower()
+            ok = bool(row.get("ok"))
+            if proto == "tcp":
+                if ok:
+                    tcp_any_ok = True
+                else:
+                    tcp_any_fail = True
+            elif proto == "udp" and ok:
+                udp_sent_ok = True
+
+        # Prefer primary IP messaging
+        label_ip = primary or ips[0]
+
+        if tcp_any_fail and not tcp_any_ok:
+            reasons.append("ru_tcp_blocked")
+            summaries.append(
+                f"с РФ (egress {egress or '?'}) TCP до {label_ip}:{ssh_port} "
+                f"не проходит — путь/хостинг режет доступ (dump тут ни при чём)"
+            )
+        elif tcp_any_fail and tcp_any_ok:
+            reasons.append("ru_tcp_partial")
+            summaries.append(
+                f"с РФ часть IP хоста недоступна по TCP (dual-IP?) — egress {egress or '?'}"
+            )
+
+        echo_senders = read_udp_echo_log(ssh, echo_log) if echo_log else []
+        details["echo_senders"] = echo_senders
+
+        udp_recv_ok = False
+        if echo_senders:
+            if egress and egress in echo_senders:
+                udp_recv_ok = True
+            elif not egress:
+                # Probe did not report egress; any sender while we expected UDP is enough.
+                udp_recv_ok = True
+            else:
+                # NAT: egress may differ from packet source seen on VPS — accept any
+                # sender if probe claimed udp send succeeded.
+                udp_recv_ok = bool(udp_sent_ok and echo_senders)
+
+        if tcp_any_ok or not tcp_any_fail:
+            if udp_sent_ok and not udp_recv_ok:
+                reasons.append("ru_udp_path_blocked")
+                summaries.append(
+                    f"с РФ UDP до {label_ip}:{echo_port} уходит с probe, "
+                    f"но на сервере пакета нет (TSPU/фильтр UDP-пути; "
+                    f"IP может быть чистым в dump). egress={egress or '?'}"
+                )
+            elif not udp_sent_ok and tcp_any_ok:
+                reasons.append("ru_udp_send_failed")
+                summaries.append(
+                    f"RU-probe не смог отправить UDP на {label_ip}:{echo_port}"
+                )
+
+        level = "ok"
+        if "ru_tcp_blocked" in reasons or "ru_udp_path_blocked" in reasons:
+            level = "blocked"
+        elif reasons:
+            level = "at_risk"
+        return {
+            "level": level,
+            "reasons": reasons,
+            "summaries": summaries,
+            "details": details,
+        }
+    finally:
+        stop_udp_echo(ssh, echo_log or "/tmp/awg-ru-echo.log")
+
+
+def rescan_dump_for_ips(index: Optional[RknDumpIndex], extra_ips: list[str]) -> Optional[RknDumpIndex]:
+    """If new IPs appeared, re-scan dump with the union of old + new watches."""
+    global _index
+    if not index or not index.ready or not index.source:
+        return index
+    extras = [ip for ip in extra_ips if ip and ip not in index.levels]
+    if not extras:
+        return index
+    union = list(index.levels.keys()) + extras
+    new_idx = match_ips_in_dump(index.source, union)
+    with _index_lock:
+        _index = new_idx
+    return new_idx

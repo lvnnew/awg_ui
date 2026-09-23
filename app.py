@@ -36,11 +36,14 @@ from managers.wireguard_manager import WireGuardManager
 from managers.rkn_monitor import (
     cache_dir_for_data_file,
     check_server_handshakes,
+    check_server_reachability,
     check_server_registry,
     default_rkn_monitor_settings,
     ensure_dump_index,
     get_dump_index,
+    list_host_ipv4s,
     merge_levels,
+    rescan_dump_for_ips,
     resolve_host_ipv4,
 )
 from managers.s3_backup import (
@@ -188,6 +191,20 @@ def _apply_to_secret_fields(data, fn):
     return data
 
 
+# SQLite Store (panel.db next to data.json). JSON remains an encrypted snapshot
+# for S3/export; audit_log and live entity state live in SQLite.
+from storage.db import default_database_url
+from storage.store import configure_store, get_store
+
+configure_store(
+    data_file=DATA_FILE,
+    encrypt_fn=_enc,
+    decrypt_fn=_dec,
+    apply_secrets_fn=_apply_to_secret_fields,
+    database_url=default_database_url(DATA_FILE),
+)
+
+
 # ======================== Translations ========================
 TRANSLATIONS = {}
 
@@ -219,33 +236,25 @@ DATA_LOCK = asyncio.Lock()
 
 
 def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    else:
-        data = {}
-    data.setdefault('servers', [])
-    data.setdefault('users', [])
-    data.setdefault('user_connections', [])
-    data.setdefault('api_tokens', [])
-    data.setdefault('invite_codes', [])
-    data.setdefault('audit_log', [])
-    data.setdefault('settings', {
-        'appearance': {
-            'title': 'Amnezia',
-            'logo': '❤️',
-            'subtitle': 'Web Panel'
-        },
-        'sync': {
-            'remnawave_url': '',
-            'remnawave_api_key': '',
-            'remnawave_sync': False,
-            'remnawave_sync_users': False,
-            'remnawave_create_conns': False,
-            'remnawave_server_id': 0,
-            'remnawave_protocol': 'awg'
+    """Load panel state from SQLite (primary) with JSON used as import/snapshot."""
+    data = get_store().load_all()
+    if not data.get('settings'):
+        data['settings'] = {
+            'appearance': {
+                'title': 'Amnezia',
+                'logo': '❤️',
+                'subtitle': 'Web Panel'
+            },
+            'sync': {
+                'remnawave_url': '',
+                'remnawave_api_key': '',
+                'remnawave_sync': False,
+                'remnawave_sync_users': False,
+                'remnawave_create_conns': False,
+                'remnawave_server_id': 0,
+                'remnawave_protocol': 'awg'
+            }
         }
-    })
     # Notification preferences (auto-broadcasts to bot users). Added lazily so
     # existing installs pick up the default without losing other settings.
     data['settings'].setdefault('notifications', {'server_events': True})
@@ -253,8 +262,6 @@ def load_data():
     data['settings'].setdefault('rkn_monitor', default_rkn_monitor_settings())
     data['settings'].setdefault('backup', default_backup_settings())
     data['settings'].setdefault('audit', default_audit_settings())
-    # Transparently decrypt secrets so callers always see plaintext.
-    _apply_to_secret_fields(data, _dec)
     return data
 
 
@@ -268,29 +275,10 @@ def _notify_bot(coro_factory):
         pass
 
 
-def save_data(data):
-    # Encrypt on a deep copy so the caller's in-memory dict stays plaintext.
-    payload = _apply_to_secret_fields(copy.deepcopy(data), _enc)
-    serialized = json.dumps(payload, indent=2, ensure_ascii=False)
-    target_dir = os.path.dirname(DATA_FILE) or '.'
+def save_data(data, *, replace_audit: bool = False):
+    """Persist to SQLite + encrypted JSON snapshot (audit_log stays SQLite-only)."""
     with _FILE_LOCK:
-        # Atomic write: temp file in the same directory + os.replace. Requires
-        # DATA_FILE to live in a normal directory (k8s mounts the PVC as a dir,
-        # not a single-file subPath), otherwise the rename across the bind mount
-        # fails.
-        fd, tmp = tempfile.mkstemp(dir=target_dir, prefix='.data.', suffix='.tmp')
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                f.write(serialized)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, DATA_FILE)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        get_store().save_all(data, replace_audit=replace_audit)
 
 
 async def save_data_async(data):
@@ -1330,9 +1318,14 @@ class RknMonitorSettingsRequest(BaseModel):
     fail_threshold: int = 2
     check_registry: bool = True
     check_handshake: bool = True
+    check_reachability: bool = True
     handshake_stale_hours: int = 6
     notify_clear: bool = True
     dump_url: str = ''
+    probe_url: str = ''
+    probe_token: str = ''
+    probe_udp_echo_port: int = 19999
+    probe_timeout_seconds: int = 20
 
 
 class BackupSettingsRequest(BaseModel):
@@ -1423,6 +1416,7 @@ async def run_scheduled_s3_backup(*, manual: bool = False) -> dict:
                 secret_key=secret_key,
                 cfg=cfg,
                 panel_version=CURRENT_VERSION,
+                db_path=os.path.join(os.path.dirname(DATA_FILE) or '.', 'panel.db'),
             )
             _persist_backup_status(data, status='ok', backup_key=result['backup_key'])
             logger.info(
@@ -1449,7 +1443,6 @@ async def periodic_s3_backup():
                 data = load_data()
                 removed = prune_audit_log(data)
                 if removed:
-                    save_data(data)
                     logger.info('Audit log pruned %s old entries', removed)
         except Exception as e:
             logger.error('periodic_audit_prune error: %s', e)
@@ -1542,52 +1535,96 @@ _rkn_last_results: list = []
 
 
 def _probe_server_rkn(server: dict, cfg: dict, index) -> dict:
-    """Blocking single-server RKN check (registry + optional handshake)."""
+    """Blocking single-server RKN check (registry + handshake + optional RU probe)."""
     name = server.get('name') or server.get('host') or '?'
     host = server.get('host') or ''
     reasons = []
     summaries = []
     ip = None
+    ips = []
     reg_level = 'ok'
     hs_level = 'ok'
+    reach_level = 'ok'
+    need_ssh = bool(
+        cfg.get('check_handshake', True)
+        or (cfg.get('check_reachability', True) and (cfg.get('probe_url') or '').strip())
+        or cfg.get('check_registry', True)  # secondary IPs via SSH
+    )
 
-    if cfg.get('check_registry', True) and index is not None:
-        try:
-            reg = check_server_registry(index, host)
-            reg_level = reg.get('level') or 'ok'
-            ip = reg.get('ip')
-            reasons.extend(reg.get('reasons') or [])
-            summaries.extend(reg.get('summaries') or [])
-        except Exception as e:
-            reasons.append(f'registry_error:{e}')
-            summaries.append(f'ошибка проверки реестра: {e}')
-
-    if cfg.get('check_handshake', True):
-        protocols = server.get('protocols') or {}
-        if any(p in protocols for p in ('awg', 'awg3', 'awg2', 'awg_legacy')):
-            ssh = None
+    ssh = None
+    extra_ips: list = []
+    try:
+        if need_ssh:
             try:
                 ssh = get_ssh(server)
                 ssh.connect()
-                hs = check_server_handshakes(
-                    ssh,
-                    protocols,
-                    stale_hours=float(cfg.get('handshake_stale_hours', 6) or 6),
-                )
-                hs_level = hs.get('level') or 'ok'
-                reasons.extend(hs.get('reasons') or [])
-                summaries.extend(hs.get('summaries') or [])
+                extra_ips = list_host_ipv4s(ssh)
             except Exception as e:
-                reasons.append(f'handshake_error:{e}')
-                summaries.append(f'ошибка проверки handshake: {e}')
-            finally:
-                try:
-                    if ssh:
-                        ssh.disconnect()
-                except Exception:
-                    pass
+                reasons.append(f'ssh_error:{e}')
+                summaries.append(f'ошибка SSH при проверке: {e}')
+                ssh = None
 
-    level = merge_levels(reg_level, hs_level)
+        if extra_ips and index is not None:
+            index = rescan_dump_for_ips(index, extra_ips) or index
+
+        if cfg.get('check_registry', True) and index is not None:
+            try:
+                reg = check_server_registry(index, host, extra_ips=extra_ips)
+                reg_level = reg.get('level') or 'ok'
+                ip = reg.get('ip')
+                ips = reg.get('ips') or ([ip] if ip else [])
+                reasons.extend(reg.get('reasons') or [])
+                summaries.extend(reg.get('summaries') or [])
+            except Exception as e:
+                reasons.append(f'registry_error:{e}')
+                summaries.append(f'ошибка проверки реестра: {e}')
+        else:
+            ip = resolve_host_ipv4(host)
+            ips = ([ip] if ip else []) + [x for x in extra_ips if x != ip]
+
+        if ssh and cfg.get('check_handshake', True):
+            protocols = server.get('protocols') or {}
+            if any(p in protocols for p in ('awg', 'awg3', 'awg2', 'awg_legacy')):
+                try:
+                    hs = check_server_handshakes(
+                        ssh,
+                        protocols,
+                        stale_hours=float(cfg.get('handshake_stale_hours', 6) or 6),
+                    )
+                    hs_level = hs.get('level') or 'ok'
+                    reasons.extend(hs.get('reasons') or [])
+                    summaries.extend(hs.get('summaries') or [])
+                except Exception as e:
+                    reasons.append(f'handshake_error:{e}')
+                    summaries.append(f'ошибка проверки handshake: {e}')
+
+        probe_url = (cfg.get('probe_url') or '').strip()
+        if ssh and cfg.get('check_reachability', True) and probe_url:
+            try:
+                reach = check_server_reachability(
+                    ssh,
+                    host,
+                    probe_url=probe_url,
+                    probe_token=(cfg.get('probe_token') or '').strip(),
+                    ssh_port=int(server.get('ssh_port', 22) or 22),
+                    echo_port=int(cfg.get('probe_udp_echo_port', 19999) or 19999),
+                    timeout=float(cfg.get('probe_timeout_seconds', 20) or 20),
+                    target_ips=ips or extra_ips,
+                )
+                reach_level = reach.get('level') or 'ok'
+                reasons.extend(reach.get('reasons') or [])
+                summaries.extend(reach.get('summaries') or [])
+            except Exception as e:
+                reasons.append(f'reachability_error:{e}')
+                summaries.append(f'ошибка RU-reachability: {e}')
+    finally:
+        try:
+            if ssh:
+                ssh.disconnect()
+        except Exception:
+            pass
+
+    level = merge_levels(reg_level, hs_level, reach_level)
     summary = '; '.join(summaries) if summaries else (
         'OK' if level == 'ok' else level
     )
@@ -1595,10 +1632,12 @@ def _probe_server_rkn(server: dict, cfg: dict, index) -> dict:
         'name': name,
         'host': host,
         'ip': ip,
+        'ips': ips,
         'level': level,
         'reasons': reasons,
         'summaries': summaries,
         'summary': summary,
+        'discovered_ips': extra_ips,
     }
 
 
@@ -1609,13 +1648,19 @@ def run_rkn_checks(cfg: dict) -> list:
     index = None
     if cfg.get('check_registry', True):
         watch_ips = []
+        seen = set()
         for s in servers:
             host = s.get('host') or ''
             if not host:
                 continue
             ip = resolve_host_ipv4(host)
-            if ip:
+            if ip and ip not in seen:
                 watch_ips.append(ip)
+                seen.add(ip)
+            for extra in s.get('public_ips') or []:
+                if extra and extra not in seen:
+                    watch_ips.append(extra)
+                    seen.add(extra)
         try:
             index = ensure_dump_index(
                 cache_dir_for_data_file(DATA_FILE),
@@ -1628,11 +1673,17 @@ def run_rkn_checks(cfg: dict) -> list:
             index = get_dump_index()
 
     results = []
+    persist_ips = False
     for s in servers:
         if not s.get('host'):
             continue
         try:
-            results.append(_probe_server_rkn(s, cfg, index))
+            row = _probe_server_rkn(s, cfg, index)
+            results.append(row)
+            discovered = row.get('discovered_ips') or []
+            if discovered and sorted(discovered) != sorted(s.get('public_ips') or []):
+                s['public_ips'] = discovered
+                persist_ips = True
         except Exception as e:
             logger.warning('RKN probe failed for %s: %s', s.get('host'), e)
             results.append({
@@ -1642,6 +1693,11 @@ def run_rkn_checks(cfg: dict) -> list:
                 'level': 'ok',
                 'reasons': [f'probe_error:{e}'],
             })
+    if persist_ips:
+        try:
+            save_data(data)
+        except Exception as e:
+            logger.warning('failed to persist public_ips: %s', e)
     return results
 
 
@@ -4047,6 +4103,7 @@ async def api_set_monitor_settings(request: Request, req: MonitorSettingsRequest
 def _public_rkn_monitor_settings(cfg: dict) -> dict:
     base = default_rkn_monitor_settings()
     merged = {**base, **(cfg or {})}
+    # Never expose probe_token in GET responses.
     return {
         'enabled': bool(merged.get('enabled', True)),
         'interval_seconds': int(merged.get('interval_seconds', 900) or 900),
@@ -4054,9 +4111,14 @@ def _public_rkn_monitor_settings(cfg: dict) -> dict:
         'fail_threshold': int(merged.get('fail_threshold', 2) or 2),
         'check_registry': bool(merged.get('check_registry', True)),
         'check_handshake': bool(merged.get('check_handshake', True)),
+        'check_reachability': bool(merged.get('check_reachability', True)),
         'handshake_stale_hours': int(merged.get('handshake_stale_hours', 6) or 6),
         'notify_clear': bool(merged.get('notify_clear', True)),
         'dump_url': (merged.get('dump_url') or base['dump_url']),
+        'probe_url': (merged.get('probe_url') or ''),
+        'probe_token_set': bool((merged.get('probe_token') or '').strip()),
+        'probe_udp_echo_port': int(merged.get('probe_udp_echo_port', 19999) or 19999),
+        'probe_timeout_seconds': int(merged.get('probe_timeout_seconds', 20) or 20),
     }
 
 
@@ -4077,6 +4139,7 @@ async def api_get_rkn_monitor_settings(request: Request):
             'dump_watched': getattr(idx, 'watched', 0) if idx else 0,
             'dump_tokens': getattr(idx, 'entry_count', 0) if idx else 0,
             'last_results': _rkn_last_results,
+            'probe_configured': bool(cfg.get('probe_url')),
         },
     }
 
@@ -4087,22 +4150,31 @@ async def api_set_rkn_monitor_settings(request: Request, req: RknMonitorSettings
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     base = default_rkn_monitor_settings()
     dump_url = (req.dump_url or '').strip() or base['dump_url']
-    payload = {
-        'enabled': bool(req.enabled),
-        'interval_seconds': max(300, min(86400, int(req.interval_seconds or 900))),
-        'dump_refresh_seconds': max(3600, min(86400 * 7, int(req.dump_refresh_seconds or 14400))),
-        'fail_threshold': max(1, min(20, int(req.fail_threshold or 2))),
-        'check_registry': bool(req.check_registry),
-        'check_handshake': bool(req.check_handshake),
-        'handshake_stale_hours': max(1, min(168, int(req.handshake_stale_hours or 6))),
-        'notify_clear': bool(req.notify_clear),
-        'dump_url': dump_url,
-    }
     async with DATA_LOCK:
         data = load_data()
+        existing = data.get('settings', {}).get('rkn_monitor') or {}
+        token = (req.probe_token or '').strip()
+        if not token:
+            token = (existing.get('probe_token') or '')
+        payload = {
+            'enabled': bool(req.enabled),
+            'interval_seconds': max(300, min(86400, int(req.interval_seconds or 900))),
+            'dump_refresh_seconds': max(3600, min(86400 * 7, int(req.dump_refresh_seconds or 14400))),
+            'fail_threshold': max(1, min(20, int(req.fail_threshold or 2))),
+            'check_registry': bool(req.check_registry),
+            'check_handshake': bool(req.check_handshake),
+            'check_reachability': bool(req.check_reachability),
+            'handshake_stale_hours': max(1, min(168, int(req.handshake_stale_hours or 6))),
+            'notify_clear': bool(req.notify_clear),
+            'dump_url': dump_url,
+            'probe_url': (req.probe_url or '').strip(),
+            'probe_token': token,
+            'probe_udp_echo_port': max(1024, min(65535, int(req.probe_udp_echo_port or 19999))),
+            'probe_timeout_seconds': max(5, min(120, int(req.probe_timeout_seconds or 20))),
+        }
         data.setdefault('settings', {})['rkn_monitor'] = payload
         save_data(data)
-    return {'status': 'success', 'rkn_monitor': payload}
+    return {'status': 'success', 'rkn_monitor': _public_rkn_monitor_settings(payload)}
 
 
 @app.post('/api/rkn_monitor/check_now', tags=["Settings"])
@@ -4252,9 +4324,15 @@ async def api_run_backup_s3(request: Request):
 async def api_backup_download(request: Request):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    if not os.path.exists(DATA_FILE):
-        return JSONResponse({'error': 'Data file not found'}, status_code=404)
-    return FileResponse(DATA_FILE, media_type='application/json', filename='data.json')
+    # Full snapshot from SQLite (includes audit_log), secrets encrypted like data.json.
+    snap = get_store().export_snapshot()
+    payload = _apply_to_secret_fields(copy.deepcopy(snap), _enc)
+    body = json.dumps(payload, indent=2, ensure_ascii=False).encode('utf-8')
+    return StreamingResponse(
+        io.BytesIO(body),
+        media_type='application/json',
+        headers={'Content-Disposition': 'attachment; filename="data.json"'},
+    )
 
 
 @app.post('/api/settings/backup/restore', tags=["Settings"])
@@ -4284,14 +4362,20 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
         # Pre-restore safety copy on the PVC (same failure domain, but protects from bad upload)
         if os.path.exists(DATA_FILE):
             shutil.copy2(DATA_FILE, f"{DATA_FILE}.pre-restore.{int(datetime.now().timestamp())}")
+        db_path = os.path.join(os.path.dirname(DATA_FILE) or '.', 'panel.db')
+        if os.path.exists(db_path):
+            shutil.copy2(db_path, f"{db_path}.pre-restore.{int(datetime.now().timestamp())}")
 
-        # Save the new data
+        # Decrypt secrets if the dump is encrypted, then replace SQLite state.
+        _apply_to_secret_fields(backup_data, _dec)
+
         async with DATA_LOCK:
-            append_audit(backup_data, _audit_actor(request), 'backup.restore', 'settings', 'data.json', {
+            save_data(backup_data, replace_audit=('audit_log' in backup_data))
+            data = load_data()
+            append_audit(data, _audit_actor(request), 'backup.restore', 'settings', 'data.json', {
                 'users': len(backup_data.get('users', [])),
                 'servers': len(backup_data.get('servers', [])),
             }, force=True)
-            save_data(backup_data)
         
         # In a real app we might want to restart or re-init background tasks
         return {'status': 'success'}

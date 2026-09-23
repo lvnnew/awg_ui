@@ -1,8 +1,7 @@
-"""Append-only admin audit log stored in data.json."""
+"""Append-only admin audit log (SQLite via Store; JSON is no longer the store)."""
 
 from __future__ import annotations
 
-import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -26,14 +25,26 @@ def audit_enabled(data: dict) -> bool:
     return bool(get_audit_settings(data).get('enabled', True))
 
 
+def _store():
+    from storage.store import get_store
+    return get_store()
+
+
 def prune_audit_log(data: dict) -> int:
     """Drop entries older than retention_days. Returns number removed."""
     days = int(get_audit_settings(data).get('retention_days') or 0)
+    try:
+        return _store().prune_audit(retention_days=days)
+    except RuntimeError:
+        # Store not ready yet (early startup) — fall back to in-memory JSON list.
+        return _prune_json(data, days)
+
+
+def _prune_json(data: dict, days: int) -> int:
     log = data.get('audit_log') or []
     if not log:
         return 0
     if days <= 0:
-        # No time-based retention; still enforce hard cap.
         if len(log) > MAX_ENTRIES:
             removed = len(log) - MAX_ENTRIES
             data['audit_log'] = log[-MAX_ENTRIES:]
@@ -59,9 +70,14 @@ def prune_audit_log(data: dict) -> int:
 
 
 def clear_audit_log(data: dict) -> int:
-    n = len(data.get('audit_log') or [])
-    data['audit_log'] = []
-    return n
+    try:
+        n = _store().clear_audit()
+        data['audit_log'] = []
+        return n
+    except RuntimeError:
+        n = len(data.get('audit_log') or [])
+        data['audit_log'] = []
+        return n
 
 
 def append_audit(
@@ -74,22 +90,40 @@ def append_audit(
     *,
     force: bool = False,
 ) -> dict | None:
-    """Append an audit entry to data (caller saves). Returns the new entry."""
-    if not force and not audit_enabled(data):
+    """Append an audit entry (SQLite). Returns the new entry."""
+    cfg = get_audit_settings(data)
+    if not force and not cfg.get('enabled', True):
         return None
-    entry = {
-        'id': str(uuid.uuid4()),
-        'at': datetime.now().isoformat(),
-        'actor': actor or 'system',
-        'action': action,
-        'target_type': target_type or '',
-        'target_id': str(target_id) if target_id else '',
-        'details': details or {},
-    }
-    log = data.setdefault('audit_log', [])
-    log.append(entry)
-    prune_audit_log(data)
-    return entry
+    try:
+        entry = _store().append_audit(
+            actor,
+            action,
+            target_type,
+            target_id,
+            details,
+            enabled=True,
+            retention_days=int(cfg.get('retention_days') or 30),
+            force=True,
+        )
+        # Keep in-memory list empty — SQLite is the source of truth.
+        data['audit_log'] = []
+        return entry
+    except RuntimeError:
+        # Pre-store fallback (should be rare).
+        import uuid
+        entry = {
+            'id': str(uuid.uuid4()),
+            'at': datetime.now().isoformat(),
+            'actor': actor or 'system',
+            'action': action,
+            'target_type': target_type or '',
+            'target_id': str(target_id) if target_id else '',
+            'details': details or {},
+        }
+        log = data.setdefault('audit_log', [])
+        log.append(entry)
+        prune_audit_log(data)
+        return entry
 
 
 def list_audit(
@@ -100,42 +134,48 @@ def list_audit(
     page: int = 1,
     size: int = 50,
 ) -> dict:
-    items = list(data.get('audit_log') or [])
-    items.reverse()  # newest first
-
-    search = (search or '').lower().strip()
-    action = (action or '').strip()
-
-    if action:
-        items = [e for e in items if e.get('action') == action]
-    if search:
-        def _match(e: dict) -> bool:
-            hay = ' '.join([
-                str(e.get('actor', '')),
-                str(e.get('action', '')),
-                str(e.get('target_type', '')),
-                str(e.get('target_id', '')),
-            ]).lower()
-            if search in hay:
-                return True
-            det = e.get('details') or {}
-            return search in str(det).lower()
-        items = [e for e in items if _match(e)]
-
-    total = len(items)
-    page = max(1, page)
-    size = max(1, min(size, 200))
-    start = (page - 1) * size
-    page_items = items[start:start + size]
-    return {
-        'entries': page_items,
-        'total': total,
-        'page': page,
-        'size': size,
-        'pages': (total + size - 1) // size if total else 0,
-        'enabled': audit_enabled(data),
-        'retention_days': get_audit_settings(data).get('retention_days', 30),
-    }
+    cfg = get_audit_settings(data)
+    try:
+        return _store().list_audit(
+            search=search,
+            action=action,
+            page=page,
+            size=size,
+            enabled=audit_enabled(data),
+            retention_days=cfg.get('retention_days', 30),
+        )
+    except RuntimeError:
+        items = list(data.get('audit_log') or [])
+        items.reverse()
+        search = (search or '').lower().strip()
+        action = (action or '').strip()
+        if action:
+            items = [e for e in items if e.get('action') == action]
+        if search:
+            def _match(e: dict) -> bool:
+                hay = ' '.join([
+                    str(e.get('actor', '')),
+                    str(e.get('action', '')),
+                    str(e.get('target_type', '')),
+                    str(e.get('target_id', '')),
+                ]).lower()
+                if search in hay:
+                    return True
+                return search in str(e.get('details') or {}).lower()
+            items = [e for e in items if _match(e)]
+        total = len(items)
+        page = max(1, page)
+        size = max(1, min(size, 200))
+        start = (page - 1) * size
+        return {
+            'entries': items[start:start + size],
+            'total': total,
+            'page': page,
+            'size': size,
+            'pages': (total + size - 1) // size if total else 0,
+            'enabled': audit_enabled(data),
+            'retention_days': cfg.get('retention_days', 30),
+        }
 
 
 def user_last_activity_at(user: dict) -> datetime | None:

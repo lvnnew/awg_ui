@@ -334,32 +334,53 @@ async def notify_rkn_alert(
     level: str = None,
     detail=None,
 ) -> None:
-    """Admin-only alert about RKN dump hits / DPI handshake symptoms."""
+    """Admin-only alert about dump hits / DPI / RU path blocks."""
     name = html.escape(server_name or host or "сервер")
     addr = html.escape(ip or host or "")
     detail_block = ""
     if detail:
         detail_block = "\n" + html.escape(str(detail))
+    detail_l = str(detail or "").lower()
+    dump_hit = "dump ркн" in detail_l or "in_rkn_dump" in detail_l
+    path_block = any(
+        x in detail_l
+        for x in ("ru_tcp", "ru_udp", "с рф (", "tspu", "udp-пут", "udp до ")
+    )
     if kind == "blocked":
+        if path_block and not dump_hit:
+            title = "⛔ <b>Недоступно с РФ (путь/TSPU)</b>"
+            note = (
+                "\n\n<i>IP может быть чистым в dump РКН: блокировка на UDP/TCP "
+                "пути провайдера, а не запись в реестре.</i>"
+            )
+        elif dump_hit and path_block:
+            title = "⛔ <b>Реестр + путь с РФ</b>"
+            note = ""
+        elif dump_hit:
+            title = "⛔ <b>IP в реестре РКН</b>"
+            note = ""
+        else:
+            title = "⛔ <b>Блокировка</b>"
+            note = ""
         text = (
-            f"⛔ <b>IP в реестре РКН</b>\n"
+            f"{title}\n"
             f"Сервер: {name}\n"
             f"IP: <code>{addr}</code>"
-            f"{detail_block}"
+            f"{detail_block}{note}"
         )
     elif kind == "at_risk":
         text = (
-            f"⚠️ <b>Риск блокировки / нет ответа VPN</b>\n"
+            f"⚠️ <b>Риск / нет ответа VPN</b>\n"
             f"Сервер: {name}\n"
             f"IP: <code>{addr}</code>"
             f"{detail_block}\n\n"
-            f"<i>Это не обязательно запись в реестре РКН: может быть DPI, "
-            f"фильтр провайдера или просто давно не подключавшиеся клиенты.</i>"
+            f"<i>Dump РКН ≠ полная картина: DPI, фильтр UDP, dual-IP или "
+            f"давно не подключавшиеся клиенты.</i>"
         )
     elif kind == "clear":
         prev = html.escape(level or "problem")
         text = (
-            f"✅ <b>РКН-статус снят</b> (было: {prev})\n"
+            f"✅ <b>Статус блокировки снят</b> (было: {prev})\n"
             f"Сервер: {name}\n"
             f"IP: <code>{addr}</code>"
         )

@@ -7,7 +7,22 @@
 
 ## [Unreleased]
 
+### Changed
+- **Мониторинг блокировок**: dump РКН больше не считается полной картиной.
+  Панель сверяет **все публичные IPv4** на хосте (dual-IP), а не только
+  поле `host`; при заданном `probe_url` гоняет TCP(SSH)+UDP(echo) с
+  российского egress (`tools/ru_reachability_probe`) — TSPU/UDP-path
+  → `blocked`, даже если IP чистый в dump. Settings: reachability,
+  probe_url / token / echo-порт. Telegram-алерты различают реестр и путь.
+
 ### Added
+- **SQLite storage** (`panel.db` рядом с `data.json` на PVC): пакет `storage/`
+  (SQLAlchemy 2 + Alembic), сущности `audit_log`, `users`, `invite_codes`,
+  `api_tokens`, `servers` (+ `legacy_index`), `user_connections`, `settings`.
+  JSON остаётся зашифрованным снимком для S3/export; audit пишется только в
+  SQLite (prune через `DELETE`). Секреты по-прежнему Fernet `enc::v1::`.
+  Env: `DATABASE_URL` (default `sqlite:////<DATA_DIR>/panel.db`).
+
 - **UI shell**: боковая навигация, страница `/monitor`, Settings по секциям,
   бейджи РКН на списке серверов. Без SPA — Jinja + `shell.css` / `panel.js`.
 
@@ -22,6 +37,8 @@
   Кэш dump: `{DATA_DIR}/rkn_cache/`. Стриминг-скан только IP флота (без загрузки
   всего реестра в RAM — иначе OOM на 512Mi). В статусе/Telegram — человекочитаемое
   описание: сервер, IP, тип сигнала, имена клиентов и давность handshake.
+- **RU reachability probe**: `tools/ru_reachability_probe/` (stdlib HTTP,
+  Docker) для деплоя на VPS в РФ; панель дергает `POST /v1/probe`.
 
 ## [2026-09-20] — Telemt: лимит docker-логов
 

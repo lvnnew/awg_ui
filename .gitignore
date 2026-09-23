@@ -30,6 +30,10 @@ coverage.xml
 
 # User data
 data.json
+panel.db
+panel.db-*
+*.db-wal
+*.db-shm
 # Local data backups / dumps (may contain plaintext secrets) — never commit
 _backup_*.json
 data.json.bak*

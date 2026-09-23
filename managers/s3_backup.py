@@ -1,5 +1,5 @@
 """
-S3-compatible off-site backup for panel state (data.json + SECRET_KEY pair).
+S3-compatible off-site backup for panel state (data.json + panel.db + SECRET_KEY).
 """
 
 from __future__ import annotations
@@ -107,8 +107,15 @@ def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')
 
 
-def _build_manifest(*, data_bytes: bytes, secret_key: str, panel_version: str, data_parsed: dict) -> dict:
-    return {
+def _build_manifest(
+    *,
+    data_bytes: bytes,
+    secret_key: str,
+    panel_version: str,
+    data_parsed: dict,
+    db_sha256: str | None = None,
+) -> dict:
+    manifest = {
         'version': BACKUP_MANIFEST_VERSION,
         'created_at': datetime.now(timezone.utc).isoformat(),
         'panel_version': panel_version,
@@ -117,12 +124,19 @@ def _build_manifest(*, data_bytes: bytes, secret_key: str, panel_version: str, d
         'servers_count': len(data_parsed.get('servers') or []),
         'users_count': len(data_parsed.get('users') or []),
         'user_connections_count': len(data_parsed.get('user_connections') or []),
-        'restore_note': 'Restore data.json together with secret.key using the same SECRET_KEY value.',
+        'restore_note': (
+            'Restore data.json + panel.db (if present) together with secret.key '
+            'using the same SECRET_KEY value.'
+        ),
     }
+    if db_sha256:
+        manifest['panel_db_sha256'] = db_sha256
+    return manifest
 
 
-def run_backup(*, data_path: str, secret_key: str, cfg: dict, panel_version: str) -> dict[str, Any]:
-    """Upload data.json + secret.key + manifest.json to S3. Returns result metadata."""
+def run_backup(*, data_path: str, secret_key: str, cfg: dict, panel_version: str,
+               db_path: str | None = None) -> dict[str, Any]:
+    """Upload data.json + panel.db + secret.key + manifest.json to S3."""
     err = validate_backup_config(cfg)
     if err:
         raise ValueError(err)
@@ -139,6 +153,13 @@ def run_backup(*, data_path: str, secret_key: str, cfg: dict, panel_version: str
     except json.JSONDecodeError as e:
         raise ValueError(f'Invalid data.json: {e}') from e
 
+    if db_path is None:
+        db_path = os.path.join(os.path.dirname(os.path.abspath(data_path)) or '.', 'panel.db')
+    db_bytes = None
+    if db_path and os.path.exists(db_path):
+        with open(db_path, 'rb') as f:
+            db_bytes = f.read()
+
     bucket = cfg['bucket'].strip()
     prefix = normalize_prefix(cfg.get('prefix'))
     stamp = _utc_stamp()
@@ -149,6 +170,7 @@ def run_backup(*, data_path: str, secret_key: str, cfg: dict, panel_version: str
         secret_key=secret_key,
         panel_version=panel_version,
         data_parsed=data_parsed,
+        db_sha256=sha256_bytes(db_bytes) if db_bytes is not None else None,
     )
     manifest_bytes = json.dumps(manifest, indent=2, ensure_ascii=False).encode('utf-8')
     secret_bytes = secret_key.encode('utf-8')
@@ -158,6 +180,11 @@ def run_backup(*, data_path: str, secret_key: str, cfg: dict, panel_version: str
         Bucket=bucket, Key=base_key + 'data.json',
         Body=data_bytes, ContentType='application/json',
     )
+    if db_bytes is not None:
+        client.put_object(
+            Bucket=bucket, Key=base_key + 'panel.db',
+            Body=db_bytes, ContentType='application/octet-stream',
+        )
     client.put_object(
         Bucket=bucket, Key=base_key + 'secret.key',
         Body=secret_bytes, ContentType='text/plain',
@@ -175,6 +202,7 @@ def run_backup(*, data_path: str, secret_key: str, cfg: dict, panel_version: str
         'bucket': bucket,
         'manifest': manifest,
         'pruned_folders': deleted,
+        'included_panel_db': db_bytes is not None,
     }
 
 

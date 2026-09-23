@@ -215,9 +215,33 @@
             </div>
             <div class="form-group" style="margin-top: var(--space-xs);">
                 <label class="form-label" style="display:flex; align-items:center; gap:8px;">
+                    <input type="checkbox" id="rknCheckReachability" onchange="saveRknMonitorSettings()" checked>
+                    {{ _('rkn_monitor_check_reachability') }}
+                </label>
+            </div>
+            <div class="form-group" style="margin-top: var(--space-xs);">
+                <label class="form-label" style="display:flex; align-items:center; gap:8px;">
                     <input type="checkbox" id="rknNotifyClear" onchange="saveRknMonitorSettings()" checked>
                     {{ _('rkn_monitor_notify_clear') }}
                 </label>
+            </div>
+            <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--space-sm); margin-top: var(--space-sm);">
+                <div class="form-group" style="margin:0; grid-column: 1 / -1;">
+                    <label class="form-label" for="rknProbeUrl">{{ _('rkn_monitor_probe_url') }}</label>
+                    <input type="text" class="form-input" id="rknProbeUrl" placeholder="http://ru-vps:8099"
+                        onchange="saveRknMonitorSettings()">
+                    <p class="form-hint" style="margin-top: var(--space-xs);">{{ _('rkn_monitor_probe_hint') }}</p>
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label class="form-label" for="rknProbeToken">{{ _('rkn_monitor_probe_token') }}</label>
+                    <input type="password" class="form-input" id="rknProbeToken" placeholder=""
+                        onchange="saveRknMonitorSettings()" autocomplete="off">
+                </div>
+                <div class="form-group" style="margin:0;">
+                    <label class="form-label" for="rknProbeEchoPort">{{ _('rkn_monitor_probe_echo_port') }}</label>
+                    <input type="number" class="form-input" id="rknProbeEchoPort" min="1024" max="65535" value="19999"
+                        onchange="saveRknMonitorSettings()">
+                </div>
             </div>
             <p class="form-hint" style="margin-top: var(--space-sm);">
                 <a href="/monitor">{{ _('monitor_hub_open') }}</a>
@@ -1360,7 +1384,12 @@
             set('rknStaleHours', cfg.handshake_stale_hours || 6);
             set('rknCheckRegistry', cfg.check_registry !== false, true);
             set('rknCheckHandshake', cfg.check_handshake !== false, true);
+            set('rknCheckReachability', cfg.check_reachability !== false, true);
             set('rknNotifyClear', cfg.notify_clear !== false, true);
+            set('rknProbeUrl', cfg.probe_url || '');
+            set('rknProbeEchoPort', cfg.probe_udp_echo_port || 19999);
+            const tok = document.getElementById('rknProbeToken');
+            if (tok) tok.placeholder = cfg.probe_token_set ? '••••••••' : '';
             const st = data.status || {};
             const hint = document.getElementById('rknStatusHint');
             const box = document.getElementById('rknProblemsBox');
@@ -1368,11 +1397,12 @@
                 const watched = st.dump_watched || 0;
                 const tokens = st.dump_tokens || 0;
                 const blocked = st.dump_exact || 0;
+                const probe = st.probe_configured ? ' · RU-probe: on' : ' · RU-probe: off';
                 const dump = st.dump_ready
                     ? ('dump OK · IP флота: ' + watched + (tokens ? (', токенов≈' + tokens) : '') + ', в реестре: ' + blocked)
                     : 'dump: ещё не загружен';
                 const bad = (st.last_results || []).filter(r => r.level && r.level !== 'ok');
-                hint.textContent = dump + (bad.length ? (' · проблем: ' + bad.length) : '');
+                hint.textContent = dump + probe + (bad.length ? (' · проблем: ' + bad.length) : '');
                 if (box) {
                     if (!bad.length) {
                         box.textContent = '';
@@ -1396,7 +1426,11 @@
             handshake_stale_hours: parseInt(document.getElementById('rknStaleHours').value, 10) || 6,
             check_registry: document.getElementById('rknCheckRegistry').checked,
             check_handshake: document.getElementById('rknCheckHandshake').checked,
+            check_reachability: document.getElementById('rknCheckReachability').checked,
             notify_clear: document.getElementById('rknNotifyClear').checked,
+            probe_url: (document.getElementById('rknProbeUrl') || {}).value || '',
+            probe_token: (document.getElementById('rknProbeToken') || {}).value || '',
+            probe_udp_echo_port: parseInt((document.getElementById('rknProbeEchoPort') || {}).value, 10) || 19999,
         };
         try {
             const res = await fetch('/api/rkn_monitor/settings', {
@@ -1411,6 +1445,12 @@
                     document.getElementById('rknDumpRefresh').value = data.rkn_monitor.dump_refresh_seconds;
                     document.getElementById('rknThreshold').value = data.rkn_monitor.fail_threshold;
                     document.getElementById('rknStaleHours').value = data.rkn_monitor.handshake_stale_hours;
+                    const pu = document.getElementById('rknProbeUrl');
+                    if (pu) pu.value = data.rkn_monitor.probe_url || '';
+                    const pe = document.getElementById('rknProbeEchoPort');
+                    if (pe) pe.value = data.rkn_monitor.probe_udp_echo_port || 19999;
+                    const pt = document.getElementById('rknProbeToken');
+                    if (pt) { pt.value = ''; pt.placeholder = data.rkn_monitor.probe_token_set ? '••••••••' : ''; }
                 }
                 showToast('Настройки РКН-мониторинга сохранены', 'success');
             } else {
