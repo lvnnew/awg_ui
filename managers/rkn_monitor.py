@@ -889,16 +889,17 @@ def stop_udp_echo(ssh, log_path: str = "/tmp/awg-ru-echo.log", port: int = DEFAU
     port = int(port)
     marker = "/tmp/awg-ru-echo.fw"
     try:
+        # Always try to remove echo fw rules (even if marker missing — leftover from crash).
         _ssh_run(
             ssh,
             "pkill -f /tmp/awg-ru-echo.py >/dev/null 2>&1 || true; "
-            f"if test -f {marker}; then "
-            f"  ufw delete allow {port}/udp >/dev/null 2>&1 || true; "
-            f"  iptables -D INPUT -p udp --dport {port} -j ACCEPT 2>/dev/null || true; "
-            f"  rm -f {marker}; "
-            f"fi; "
-            f"rm -f {log_path} /tmp/awg-ru-echo.py /tmp/awg-ru-echo.out",
-            timeout=20,
+            # Non-interactive delete (v4 + v6 rules with comment).
+            f"ufw --force delete allow {port}/udp >/dev/null 2>&1 || true; "
+            f"ufw --force delete allow {port}/udp >/dev/null 2>&1 || true; "
+            f"iptables -D INPUT -p udp --dport {port} -j ACCEPT 2>/dev/null || true; "
+            f"ip6tables -D INPUT -p udp --dport {port} -j ACCEPT 2>/dev/null || true; "
+            f"rm -f {marker} {log_path} /tmp/awg-ru-echo.py /tmp/awg-ru-echo.out",
+            timeout=25,
         )
     except Exception:
         pass
