@@ -829,10 +829,14 @@ def start_udp_echo(ssh, port: int, listen_seconds: float = 25.0) -> str:
     """Start background UDP echo on the server; return log path."""
     log = "/tmp/awg-ru-echo.log"
     script = "/tmp/awg-ru-echo.py"
-    # Upload script via heredoc so pkill can target a stable path.
+    # Open echo port (ufw/iptables) — docker AWG ports are published, bare
+    # 19999 usually is not, which would false-positive as TSPU.
     write_cmd = (
         f"cat > {script} <<'AWGEOF'\n{_UDP_ECHO_PY}\nAWGEOF\n"
         f"pkill -f '{script}' 2>/dev/null; rm -f {log}; "
+        f"iptables -C INPUT -p udp --dport {port} -j ACCEPT 2>/dev/null "
+        f"|| iptables -I INPUT -p udp --dport {port} -j ACCEPT; "
+        f"(command -v ufw >/dev/null && ufw allow {port}/udp >/dev/null 2>&1) || true; "
         f"nohup python3 {script} {port} {log} {listen_seconds} "
         f">/tmp/awg-ru-echo.out 2>&1 & echo $!"
     )
@@ -851,11 +855,13 @@ def read_udp_echo_log(ssh, log_path: str) -> list[str]:
     return ips
 
 
-def stop_udp_echo(ssh, log_path: str = "/tmp/awg-ru-echo.log"):
+def stop_udp_echo(ssh, log_path: str = "/tmp/awg-ru-echo.log", port: int = DEFAULT_UDP_ECHO_PORT):
     try:
         _ssh_run(
             ssh,
             "pkill -f '/tmp/awg-ru-echo.py' 2>/dev/null; "
+            f"iptables -D INPUT -p udp --dport {int(port)} -j ACCEPT 2>/dev/null || true; "
+            f"(command -v ufw >/dev/null && ufw delete allow {int(port)}/udp >/dev/null 2>&1) || true; "
             f"rm -f {log_path} /tmp/awg-ru-echo.out /tmp/awg-ru-echo.py",
             timeout=10,
         )
@@ -863,7 +869,6 @@ def stop_udp_echo(ssh, log_path: str = "/tmp/awg-ru-echo.log"):
         pass
 
 
-# kept for callers that imported the helper name earlier in the module body
 def _shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
@@ -1004,7 +1009,7 @@ def check_server_reachability(
             "details": details,
         }
     finally:
-        stop_udp_echo(ssh, echo_log or "/tmp/awg-ru-echo.log")
+        stop_udp_echo(ssh, echo_log or "/tmp/awg-ru-echo.log", port=int(echo_port))
 
 
 def rescan_dump_for_ips(index: Optional[RknDumpIndex], extra_ips: list[str]) -> Optional[RknDumpIndex]:
