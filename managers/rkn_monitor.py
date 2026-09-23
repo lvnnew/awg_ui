@@ -826,21 +826,27 @@ def _ssh_run(ssh, cmd: str, timeout: int = 30):
 
 
 def start_udp_echo(ssh, port: int, listen_seconds: float = 25.0) -> str:
-    """Start background UDP echo on the server; return log path."""
+    """Start background UDP echo on the server; return log path.
+
+    Uses setsid + closed stdin so the SSH channel can exit while echo keeps
+    running (paramiko otherwise hangs on background jobs).
+    """
+    import base64
+
     log = "/tmp/awg-ru-echo.log"
     script = "/tmp/awg-ru-echo.py"
-    # Open echo port (ufw/iptables) — docker AWG ports are published, bare
-    # 19999 usually is not, which would false-positive as TSPU.
-    write_cmd = (
-        f"cat > {script} <<'AWGEOF'\n{_UDP_ECHO_PY}\nAWGEOF\n"
-        f"pkill -f '{script}' 2>/dev/null; rm -f {log}; "
-        f"iptables -C INPUT -p udp --dport {port} -j ACCEPT 2>/dev/null "
-        f"|| iptables -I INPUT -p udp --dport {port} -j ACCEPT; "
-        f"(command -v ufw >/dev/null && ufw allow {port}/udp >/dev/null 2>&1) || true; "
-        f"nohup python3 {script} {port} {log} {listen_seconds} "
-        f">/tmp/awg-ru-echo.out 2>&1 & echo $!"
+    b64 = base64.b64encode(_UDP_ECHO_PY.encode("utf-8")).decode("ascii")
+    # Kill previous quietly in its own invocation (pkill can confuse channels).
+    _ssh_run(ssh, "pkill -f /tmp/awg-ru-echo.py >/dev/null 2>&1 || true", timeout=10)
+    write = (
+        f"echo {b64} | base64 -d > {script} && "
+        f"rm -f {log} && "
+        f"setsid python3 {script} {int(port)} {log} {float(listen_seconds)} "
+        f"</dev/null >/tmp/awg-ru-echo.out 2>&1 & echo $!"
     )
-    _ssh_run(ssh, write_cmd, timeout=20)
+    out, err, code = _ssh_run(ssh, write, timeout=20)
+    if code != 0:
+        logger.warning("start_udp_echo failed code=%s out=%s err=%s", code, out, err)
     time.sleep(0.5)
     return log
 
@@ -859,11 +865,9 @@ def stop_udp_echo(ssh, log_path: str = "/tmp/awg-ru-echo.log", port: int = DEFAU
     try:
         _ssh_run(
             ssh,
-            "pkill -f '/tmp/awg-ru-echo.py' 2>/dev/null; "
-            f"iptables -D INPUT -p udp --dport {int(port)} -j ACCEPT 2>/dev/null || true; "
-            f"(command -v ufw >/dev/null && ufw delete allow {int(port)}/udp >/dev/null 2>&1) || true; "
-            f"rm -f {log_path} /tmp/awg-ru-echo.out /tmp/awg-ru-echo.py",
-            timeout=10,
+            "pkill -f /tmp/awg-ru-echo.py >/dev/null 2>&1 || true; "
+            f"rm -f {log_path} /tmp/awg-ru-echo.py /tmp/awg-ru-echo.out",
+            timeout=15,
         )
     except Exception:
         pass
