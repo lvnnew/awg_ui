@@ -1601,6 +1601,13 @@ def _restore_rkn_snapshot():
         logger.warning('restore rkn snapshot failed: %s', e)
 
 
+def _ensure_rkn_loaded():
+    """Lazy-load snapshot into memory if the process has an empty view."""
+    if _rkn_last_results:
+        return
+    _restore_rkn_snapshot()
+
+
 def _probe_server_rkn(server: dict, cfg: dict, index) -> dict:
     """Blocking single-server RKN check (registry + handshake + optional RU probe)."""
     name = server.get('name') or server.get('host') or '?'
@@ -2192,6 +2199,7 @@ async def api_servers_status(request: Request):
     cur = get_current_user(request)
     if not cur or cur['role'] not in ('admin', 'support'):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    _ensure_rkn_loaded()
     results = await asyncio.to_thread(get_servers_status)
     # Attach last known RKN levels from in-memory state
     rkn_by_host = {k: v for k, v in (_rkn_state or {}).items()}
@@ -4197,9 +4205,14 @@ def _public_rkn_monitor_settings(cfg: dict) -> dict:
 async def api_get_rkn_monitor_settings(request: Request):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    _ensure_rkn_loaded()
     data = load_data()
     cfg = _public_rkn_monitor_settings(data.get('settings', {}).get('rkn_monitor') or {})
     idx = get_dump_index()
+    last = _rkn_last_results
+    if not last:
+        snap = (data.get('settings') or {}).get('rkn_monitor_snapshot') or {}
+        last = snap.get('last_results') or []
     return {
         'rkn_monitor': cfg,
         'status': {
@@ -4209,8 +4222,9 @@ async def api_get_rkn_monitor_settings(request: Request):
             'dump_networks': len(idx.networks) if idx else 0,
             'dump_watched': getattr(idx, 'watched', 0) if idx else 0,
             'dump_tokens': getattr(idx, 'entry_count', 0) if idx else 0,
-            'last_results': _rkn_last_results,
+            'last_results': last,
             'probe_configured': bool(cfg.get('probe_url')),
+            'snapshot_at': ((data.get('settings') or {}).get('rkn_monitor_snapshot') or {}).get('updated_at'),
         },
     }
 
